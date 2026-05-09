@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.bak
+*.new
+.env
+shim.env
+shim.log
