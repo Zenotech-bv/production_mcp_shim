@@ -116,7 +116,7 @@ from mcp.server.fastmcp import FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "2.2.5"
+_SHIM_VERSION = "2.2.6"
 
 
 # ---------------------------------------------------------------------------
@@ -849,7 +849,18 @@ def _build_merged_registry(
                 continue
 
             # Always register the prefixed form.
-            prefixed = f"{backend.name}.{orig}"
+            #
+            # v2.2.6 hotfix: prefix separator is '_' not '.'. Claude's
+            # API rejects tool names that don't match
+            # ``^[a-zA-Z0-9_-]{1,64}$`` -- the '.' separator we used in
+            # v2.2.4 and v2.2.5 triggered
+            # ``tools.N.FrontendRemoteMcpToolDefinition.name: String
+            # should match pattern...`` validation errors as soon as
+            # any laptop activated more than one backend. The bug was
+            # latent in v2.2.4 (no laptop had a second backend
+            # configured) and fired the day v2.2.5's auto-create
+            # finally wired up the Zabbix backend on a real laptop.
+            prefixed = f"{backend.name}_{orig}"
             name_to_backend[prefixed] = (backend, orig)
             registrations.append((prefixed, tool, backend))
 
@@ -1042,8 +1053,12 @@ def _register_one(registered_name: str, tool: dict, backend: Backend) -> None:
         tool.get("description") or ""
     ).replace(chr(34) * 3, "").replace(chr(92), chr(92) * 2).strip()
 
-    # Function name must be a valid Python identifier; FastMCP's tool()
-    # decorator can override the registered name via `name=`.
+    # v2.2.6: registered_name uses '_' as the prefix separator (was '.'
+    # in v2.2.4/v2.2.5). Underscores are valid Python identifiers AND
+    # valid MCP tool names per Claude's ``^[a-zA-Z0-9_-]{1,64}$`` regex,
+    # so no special-case handling is needed any more. The .replace()
+    # calls below are kept defensively in case an upstream tool name
+    # somehow contains '.' or '-'.
     safe_fn_name = registered_name.replace(".", "_").replace("-", "_")
     src = (
         f"def {safe_fn_name}({sig}) -> str:\n"
@@ -1053,9 +1068,10 @@ def _register_one(registered_name: str, tool: dict, backend: Backend) -> None:
     ns: dict = {"_forwarder": forwarder}
     exec(src, ns)
     typed_fn = ns[safe_fn_name]
-    # Use FastMCP's name= parameter to register the dotted form (which
-    # isn't a valid Python identifier).
-    if "." in registered_name or "-" in registered_name:
+    # If the registered name differs from the Python-safe form (e.g.
+    # an upstream tool name contains '-'), tell FastMCP the desired
+    # registered name explicitly.
+    if safe_fn_name != registered_name:
         mcp.tool(name=registered_name)(typed_fn)
     else:
         mcp.tool()(typed_fn)
