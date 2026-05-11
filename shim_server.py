@@ -116,7 +116,7 @@ from mcp.server.fastmcp import FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "2.2.4"
+_SHIM_VERSION = "2.2.5"
 
 
 # ---------------------------------------------------------------------------
@@ -364,10 +364,107 @@ def _load_backends_from_file(path: Path) -> tuple[list[Backend], str | None]:
     return backends, primary_name
 
 
+# v2.2.5 — zero-touch backends.json bootstrap.
+#
+# Background. v2.2.4 introduced the multi-backend federator and the
+# backends.json config file, but laptops needed an operator to drop
+# that file by hand at `%APPDATA%\Punch\backends.json` before Zabbix
+# (or any non-SAP backend) would light up. For Punch's deployment
+# shape -- one organisation, one PUNCH_SAP_KEY per user, one set of
+# canonical backend URLs -- the file's contents are deterministic.
+# v2.2.5 seeds it automatically on first startup when:
+#
+#   * The resolved path doesn't already have a file (user authority
+#     ALWAYS wins; we never clobber an existing config).
+#   * PUNCH_SAP_KEY is set (so we have something to populate the
+#     `key` field with for every backend).
+#
+# The seed populates each backend with the user's existing
+# PUNCH_SAP_KEY. Per-backend keys can be filled in later by the
+# operator -- the SAP server and Zabbix adapter currently share
+# `users.json` so a single key works for both, but the structure
+# is per-backend so the day a backend gets its own auth surface,
+# only that backend's entry needs an edit.
+#
+# New backends ship via a new shim version (the canonical source is
+# auto-updated from GitHub when PUNCH_SHIM_AUTO_UPDATE=1). The
+# default template below is the source of truth for the Punch
+# Powertrain deployment; multi-tenant deployments should fork.
+_DEFAULT_BACKENDS_TEMPLATE: dict = {
+    "backends": [
+        {
+            "name":   "sap",
+            "url":    "http://mcp.punchpowertrain.com:3000",
+            "header": "X-Punch-Auth",
+        },
+        {
+            "name":   "zabbix",
+            "url":    "http://mcp.punchpowertrain.com:3002",
+            "header": "X-Punch-Auth",
+        },
+    ],
+    "primary": "sap",
+}
+
+
+def _maybe_seed_backends_file(cfg_path: Path) -> bool:
+    """If cfg_path doesn't exist AND PUNCH_SAP_KEY is set, write a
+    default backends.json populated with that key for every backend.
+
+    Returns True if a file was written, False otherwise. Failures are
+    swallowed -- a malformed cwd or read-only filesystem must not
+    prevent the shim from starting; the env-var fallback path covers
+    that case.
+    """
+    if cfg_path.exists():
+        return False
+    if not PUNCH_SAP_KEY:
+        return False
+    # Build the seed payload from the template.
+    seed: dict = {
+        "backends": [
+            {**entry, "key": PUNCH_SAP_KEY}
+            for entry in _DEFAULT_BACKENDS_TEMPLATE["backends"]
+        ],
+        "primary": _DEFAULT_BACKENDS_TEMPLATE["primary"],
+    }
+    try:
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(json.dumps(seed, indent=2), encoding="utf-8")
+    except OSError as e:
+        _log_event(
+            "backends_file_seed_failed",
+            level=logging.WARNING,
+            path=str(cfg_path),
+            error=f"{type(e).__name__}: {e}",
+        )
+        return False
+    _log_event(
+        "backends_file_seeded",
+        path=str(cfg_path),
+        backend_count=len(seed["backends"]),
+        backend_names=[b["name"] for b in seed["backends"]],
+        primary=seed["primary"],
+        note=(
+            "first-run auto-create; populated all backends with "
+            "PUNCH_SAP_KEY. Edit the file to issue per-backend keys."
+        ),
+    )
+    return True
+
+
 def _load_backends() -> tuple[list[Backend], Backend | None]:
     """Resolve the backend list. Falls back to single-backend env vars
-    when backends.json is missing. Returns (backends, primary)."""
+    when backends.json is missing. Returns (backends, primary).
+
+    v2.2.5 -- if the resolved path doesn't exist, attempt a one-time
+    auto-create from the baked-in template before falling through to
+    the legacy env-var path. See `_maybe_seed_backends_file` for the
+    conditions under which the seed actually writes.
+    """
     cfg_path = _resolve_backends_path()
+    # v2.2.5: zero-touch first-run seed
+    _maybe_seed_backends_file(cfg_path)
     if cfg_path.exists():
         try:
             backends, primary_name = _load_backends_from_file(cfg_path)
