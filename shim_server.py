@@ -97,6 +97,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -116,7 +117,7 @@ from mcp.server.fastmcp import FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "2.2.6"
+_SHIM_VERSION = "2.2.7"
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +135,57 @@ load_dotenv()  # also pick up a .env if the user keeps one
 # resolved (e.g. shim_start log before we know which backend is primary).
 PUNCH_SAP_URL = os.getenv("PUNCH_SAP_URL", "http://mcp.punchpowertrain.com:3000").rstrip("/")
 PUNCH_SAP_KEY = os.getenv("PUNCH_SAP_KEY", "").strip()
+
+# v2.2.7 — placeholder-key guard. The shim's module-level _load_backends()
+# call (line ~559) runs against the REAL %APPDATA%\Punch\backends.json
+# path whenever this module is imported. If pytest imports the shim with
+# `PUNCH_SAP_KEY="test-fixture-key"` already set (which the test files
+# in tests/test_v2_2_4_multi_backend.py + tests/test_v2_2_5_backends_seed.py
+# do via os.environ.setdefault at module top-level), the auto-seed wrote
+# that placeholder string into a real user's APPDATA, where it stayed
+# undetected across multiple shim upgrades because the auto-seed's
+# `if cfg_path.exists(): return False` guard refused to overwrite.
+#
+# v2.2.7 detects placeholder-shaped values and refuses to USE them as
+# auth -- both at env-load time AND at backends.json load time. The
+# net effect: a test-fixture-contaminated user falls through to the
+# env-var fallback (which, in Claude Desktop with a properly-filled
+# user_config, has the real key) instead of sending a known-bad
+# placeholder on every request.
+#
+# Detection: regex matches obvious test-fixture shapes (case-insensitive).
+# Also rejects suspiciously short keys -- real keys from
+# `secrets.token_urlsafe(32)` are 43 chars.
+_PLACEHOLDER_KEY_PATTERNS = (
+    re.compile(r"^test[-_]?(fixture|key|placeholder)", re.IGNORECASE),
+    re.compile(r"^(replace|insert|paste|your[-_]?key)", re.IGNORECASE),
+    re.compile(r"^(xxx|placeholder|api[-_]?key|secret)$", re.IGNORECASE),
+)
+_MIN_REAL_KEY_LEN = 16  # real keys are 43+ chars; 16 is a generous floor
+
+
+def _looks_like_placeholder(key: str) -> bool:
+    if not key:
+        return False
+    if len(key) < _MIN_REAL_KEY_LEN:
+        return True
+    for pat in _PLACEHOLDER_KEY_PATTERNS:
+        if pat.match(key):
+            return True
+    return False
+
+
+# Apply guard to the legacy env-var fallback. If PUNCH_SAP_KEY is a
+# placeholder, treat it as if unset so the shim doesn't send it AND
+# the auto-seed doesn't write it to a fresh backends.json.
+if PUNCH_SAP_KEY and _looks_like_placeholder(PUNCH_SAP_KEY):
+    sys.stderr.write(
+        f"[shim v{_SHIM_VERSION}] WARNING: PUNCH_SAP_KEY env var looks "
+        f"like a placeholder ({PUNCH_SAP_KEY[:8]}...); treating as unset. "
+        f"Check your Claude Desktop user_config / shim.env.\n"
+    )
+    PUNCH_SAP_KEY = ""
+
 PUNCH_SAP_TIMEOUT = float(os.getenv("PUNCH_SAP_TIMEOUT", "300"))
 _verify_tls = os.getenv("PUNCH_SAP_VERIFY_TLS", "true").lower() != "false"
 _AUTO_UPDATE = os.getenv("PUNCH_SHIM_AUTO_UPDATE", "0").strip() == "1"
@@ -339,6 +391,29 @@ def _load_backends_from_file(path: Path) -> tuple[list[Backend], str | None]:
         url = (entry.get("url") or "").strip()
         header = (entry.get("header") or "X-Punch-Auth").strip()
         key = (entry.get("key") or "").strip()
+        # v2.2.7 -- placeholder-key guard at file-load time. If the file
+        # contains a test-fixture or otherwise-placeholder key (the
+        # specific class of contamination caused by an earlier shim's
+        # module-level _load_backends() picking up `PUNCH_SAP_KEY=
+        # test-fixture-key` from a pytest import context), drop the
+        # key here so the rest of the shim falls through to the
+        # env-var fallback path. Logs LOUDLY -- the goal is for a
+        # contaminated user to see a clear signal in their server.log
+        # without having to inspect backends.json by hand.
+        if key and _looks_like_placeholder(key):
+            _log_event(
+                "backends_entry_placeholder_key",
+                level=logging.WARNING,
+                index=i, backend=name, key_preview=key[:8] + "...",
+                path=str(path),
+                note=(
+                    "key in backends.json looks like a placeholder -- "
+                    "treating as unset. If this is intentional, rename "
+                    "the placeholder; otherwise delete the file and let "
+                    "the auto-seed recreate it from a real PUNCH_SAP_KEY."
+                ),
+            )
+            key = ""
         if not name:
             _log_event("backends_entry_skipped", level=logging.WARNING,
                        index=i, reason="missing_name")

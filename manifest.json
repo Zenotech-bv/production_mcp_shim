@@ -1,8 +1,8 @@
 {
-  "version": "2.2.6",
-  "sha256": "a7ee88f8964de98cf6945bdd9852657fe51d6a4decf0b64fc72cd9283e34ba85",
-  "size_bytes": 41644,
-  "released_at": "2026-05-11T10:52:12Z",
+  "version": "2.2.7",
+  "sha256": "a93e73525b46faa39c58ea73cb9286277c2ef5158e4f1ce19d6d56f4a4c2257d",
+  "size_bytes": 45187,
+  "released_at": "2026-05-12T12:27:40Z",
   "min_supported_version": null,
   "source_url": "https://raw.githubusercontent.com/Zenotech-bv/production_mcp_shim/main/shim_server.py",
   "description": "Punch Analytics stdio shim. Canonical source."
