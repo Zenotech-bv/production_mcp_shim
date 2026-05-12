@@ -82,7 +82,10 @@ first entry.
     PUNCH_SAP_KEY         — per-user API key issued by the SAP admin
     PUNCH_SAP_TIMEOUT     — read-timeout seconds, default 300
     PUNCH_SAP_VERIFY_TLS  — "false" to skip TLS verification (internal CA)
-    PUNCH_SHIM_AUTO_UPDATE — "1" to enable startup self-update from server
+    PUNCH_SHIM_AUTO_UPDATE — truthy ("1", "true", "yes", "on", case-insensitive)
+                              to enable startup self-update from the canonical
+                              GitHub repo + server fallback (v2.2.8 broadened
+                              the accepted values from "1"-only)
     PUNCH_SHIM_DEBUG      — "1" to enable DEBUG-level logging
 
 New in v2.2.4:
@@ -117,7 +120,7 @@ from mcp.server.fastmcp import FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "2.2.7"
+_SHIM_VERSION = "2.2.8"
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +191,13 @@ if PUNCH_SAP_KEY and _looks_like_placeholder(PUNCH_SAP_KEY):
 
 PUNCH_SAP_TIMEOUT = float(os.getenv("PUNCH_SAP_TIMEOUT", "300"))
 _verify_tls = os.getenv("PUNCH_SAP_VERIFY_TLS", "true").lower() != "false"
-_AUTO_UPDATE = os.getenv("PUNCH_SHIM_AUTO_UPDATE", "0").strip() == "1"
+# v2.2.8: accept any of the standard truthy values. Pre-v2.2.8 this only
+# matched "1"; "true" / "yes" / "on" silently failed even though those
+# are what the MCPB user_config field defaults to in Claude Desktop's
+# UI. Comparison is case-insensitive after a strip().
+_AUTO_UPDATE = os.getenv("PUNCH_SHIM_AUTO_UPDATE", "0").strip().lower() in (
+    "1", "true", "yes", "on", "enable", "enabled",
+)
 _DEBUG = os.getenv("PUNCH_SHIM_DEBUG", "0").strip() == "1"
 
 
