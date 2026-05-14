@@ -112,7 +112,7 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 # ---------------------------------------------------------------------------
 # Shim self-version. Bump alongside MCPB version (manifest.json::version).
@@ -120,7 +120,7 @@ from mcp.server.fastmcp import FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "2.2.9"
+_SHIM_VERSION = "2.3.0"
 
 
 # ---------------------------------------------------------------------------
@@ -974,6 +974,33 @@ def _build_merged_registry(
 _NAME_TO_BACKEND, _REGISTRATIONS = _build_merged_registry(_BACKENDS)
 
 
+def _reload_registry() -> tuple[
+    dict[str, tuple["Backend", str]],
+    list[tuple[str, dict, "Backend"]],
+    list[str],
+]:
+    """Re-fetch every configured backend's /tools and rebuild the registry.
+
+    Safety: a backend whose re-fetch fails (None or empty) KEEPS its
+    previously-known tools — a transient fetch failure must never silently
+    unregister a whole backend's catalogue. Returns
+    (name_to_backend, registrations, fetch_failures).
+    """
+    fetch_failures: list[str] = []
+    for backend in _BACKENDS:
+        if not backend.is_configured:
+            continue
+        fresh = _fetch_tools_for_backend(backend)
+        if fresh:                          # non-empty list — adopt it
+            backend.tools = fresh
+        else:                              # None (error) or [] — keep stale
+            fetch_failures.append(backend.name)
+    # _build_merged_registry skips the network fetch when backend.tools is
+    # already populated, so it rebuilds from exactly what we set/kept above.
+    name_to_backend, registrations = _build_merged_registry(_BACKENDS)
+    return name_to_backend, registrations, fetch_failures
+
+
 # ---------------------------------------------------------------------------
 # _call_remote — looks up the backend and forwards
 # ---------------------------------------------------------------------------
@@ -1168,6 +1195,95 @@ def _register_one(registered_name: str, tool: dict, backend: Backend) -> None:
 
 for _registered_name, _tool, _backend in _REGISTRATIONS:
     _register_one(_registered_name, _tool, _backend)
+
+
+# ---------------------------------------------------------------------------
+# v2.3.0 — shim_reload: pick up new/changed backend tools without a Claude
+# Desktop restart. The shim fetches each backend's /tools once at startup; a
+# backend that gains a tool (e.g. a new pa_v2 analytical) was invisible until
+# Desktop was fully restarted. shim_reload re-fetches, diffs, register/
+# unregisters in place, and emits notifications/tools/list_changed so the
+# client re-pulls the catalogue mid-conversation.
+# ---------------------------------------------------------------------------
+
+async def shim_reload(ctx: Context) -> str:
+    """Re-fetch the tool catalogue from every Punch backend and update this
+    shim's registered tools in place — no Claude Desktop restart needed. Call
+    this after a backend gains, drops, or changes a tool."""
+    global _NAME_TO_BACKEND, _REGISTRATIONS
+    try:
+        old_tool_by_name = {name: tool for name, tool, _b in _REGISTRATIONS}
+
+        new_name_to_backend, new_registrations, fetch_failures = _reload_registry()
+        new_tool_by_name    = {name: tool for name, tool, _b in new_registrations}
+        new_backend_by_name = {name: b for name, _t, b in new_registrations}
+
+        added   = [n for n in new_tool_by_name if n not in old_tool_by_name]
+        removed = [n for n in old_tool_by_name if n not in new_tool_by_name]
+        changed = [n for n in new_tool_by_name
+                   if n in old_tool_by_name and new_tool_by_name[n] != old_tool_by_name[n]]
+
+        register_failures: list[str] = []
+
+        # Drop tools that are gone or whose schema changed (changed ones are
+        # re-added below). Defensive try/except — a stuck removal must not
+        # abort the whole reload.
+        for name in removed + changed:
+            try:
+                mcp.remove_tool(name)
+            except Exception as e:
+                _log_event("shim_reload_remove_failed", level=logging.WARNING,
+                           tool=name, error=f"{type(e).__name__}: {e}")
+
+        # (Re-)register new and changed tools. Per-tool try/except so one bad
+        # schema can't take the rest of the reload down.
+        for name in added + changed:
+            try:
+                _register_one(name, new_tool_by_name[name], new_backend_by_name[name])
+            except Exception as e:
+                register_failures.append(name)
+                _log_event("shim_reload_register_failed", level=logging.WARNING,
+                           tool=name, error=f"{type(e).__name__}: {e}")
+
+        _NAME_TO_BACKEND = new_name_to_backend
+        _REGISTRATIONS   = new_registrations
+
+        catalogue_moved = bool(added or removed or changed)
+        if catalogue_moved:
+            await ctx.session.send_tool_list_changed()
+
+        _log_event("shim_reload_done",
+                   added=sorted(added), removed=sorted(removed),
+                   changed=sorted(changed), total=len(new_registrations),
+                   fetch_failures=fetch_failures,
+                   register_failures=register_failures)
+
+        if catalogue_moved:
+            note = ("Claude Desktop has been notified (tools/list_changed); the "
+                    "updated tool list is live in this conversation.")
+        else:
+            note = "No changes — every backend's catalogue is already current."
+        return json.dumps({
+            "reloaded": True,
+            "added": sorted(added),
+            "removed": sorted(removed),
+            "changed": sorted(changed),
+            "total_registered": len(new_registrations),
+            "fetch_failures": fetch_failures,
+            "register_failures": register_failures,
+            "note": note,
+        }, indent=2)
+    except Exception as e:
+        _log_event("shim_reload_failed", level=logging.ERROR,
+                   error=f"{type(e).__name__}: {e}")
+        return json.dumps({
+            "reloaded": False,
+            "error_type": type(e).__name__,
+            "message": str(e),
+        }, indent=2)
+
+
+mcp.tool()(shim_reload)
 
 
 # ---------------------------------------------------------------------------
