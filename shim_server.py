@@ -120,7 +120,7 @@ from mcp.server.fastmcp import FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "2.2.8"
+_SHIM_VERSION = "2.2.9"
 
 
 # ---------------------------------------------------------------------------
@@ -932,28 +932,27 @@ def _build_merged_registry(
             if not isinstance(orig, str) or not orig:
                 continue
 
-            # Always register the prefixed form.
+            # v2.2.9: register EITHER the bare name OR the prefixed form,
+            # never both. Pre-2.2.9 we ALWAYS registered the prefixed
+            # `<backend>_<tool>` AND additionally the bare alias when there
+            # was no collision -- which doubled the catalogue: every tool
+            # on a single-backend-for-that-name showed up twice (e.g.
+            # `pa_extract_lfa1` AND `pa_v2_pa_extract_lfa1`). Now: no
+            # collision -> bare only; collision -> prefixed forms only.
             #
-            # v2.2.6 hotfix: prefix separator is '_' not '.'. Claude's
-            # API rejects tool names that don't match
-            # ``^[a-zA-Z0-9_-]{1,64}$`` -- the '.' separator we used in
-            # v2.2.4 and v2.2.5 triggered
-            # ``tools.N.FrontendRemoteMcpToolDefinition.name: String
-            # should match pattern...`` validation errors as soon as
-            # any laptop activated more than one backend. The bug was
-            # latent in v2.2.4 (no laptop had a second backend
-            # configured) and fired the day v2.2.5's auto-create
-            # finally wired up the Zabbix backend on a real laptop.
-            prefixed = f"{backend.name}_{orig}"
-            name_to_backend[prefixed] = (backend, orig)
-            registrations.append((prefixed, tool, backend))
-
-            # Bare alias only when no collision.
-            if bare_counts[orig] == 1:
+            # The prefix separator stays '_' (not the v2.2.4/2.2.5 '.').
+            # Claude's API rejects tool names that don't match
+            # ``^[a-zA-Z0-9_-]{1,64}$``; the '.' separator triggered
+            # ``tools.N.FrontendRemoteMcpToolDefinition.name`` validation
+            # errors as soon as any laptop activated a second backend.
+            if bare_counts[orig] > 1:
+                prefixed = f"{backend.name}_{orig}"
+                name_to_backend[prefixed] = (backend, orig)
+                registrations.append((prefixed, tool, backend))
+                collisions[orig].append(backend.name)
+            else:
                 name_to_backend[orig] = (backend, orig)
                 registrations.append((orig, tool, backend))
-            else:
-                collisions[orig].append(backend.name)
 
     if collisions:
         for name, backend_names in collisions.items():
@@ -1133,8 +1132,14 @@ def _register_one(registered_name: str, tool: dict, backend: Backend) -> None:
     sig = ", ".join(params)
 
     forwarder = _make_forwarder(registered_name)
+    # v2.2.9: prefix the description with the backend name so an LLM
+    # client can answer "what <backend> tools do I have?" by text-searching
+    # descriptions. The federator collapses every backend into one MCP
+    # connector, so without this the backend-of-origin is invisible -- a
+    # Zabbix tool reads identically to a SAP tool.
+    upstream_desc = tool.get("description") or ""
     safe_desc = (
-        tool.get("description") or ""
+        f"[{backend.name}] {upstream_desc}".strip()
     ).replace(chr(34) * 3, "").replace(chr(92), chr(92) * 2).strip()
 
     # v2.2.6: registered_name uses '_' as the prefix separator (was '.'
