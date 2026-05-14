@@ -1,0 +1,11 @@
+# shim_server.py is fetched verbatim by the auto-updater and hashed against
+# manifest.json's sha256. Line endings MUST be deterministic or the hash
+# check fails on every platform that commits with a different eol policy.
+# Pin to LF everywhere — that's what GitHub raw serves and what the
+# updater writes to disk.
+*           text=auto eol=lf
+shim_server.py  text eol=lf
+manifest.json   text eol=lf
+*.py        text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
