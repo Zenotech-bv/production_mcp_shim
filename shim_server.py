@@ -91,6 +91,17 @@ first entry.
 New in v2.2.4:
 
     PUNCH_BACKENDS_FILE   — explicit path to backends.json (overrides default)
+
+New in v2.3.1:
+
+    PUNCH_SHIM_RELOAD_INTERVAL_S — how often (seconds) the shim re-stat's
+                              backends.json to pick up a key rotation.
+                              Default 2. The check is a single cheap stat
+                              call; only an actual mtime delta triggers
+                              the JSON re-read + reconcile. Lowering this
+                              shortens the rotation window further; raising
+                              it eliminates the per-call stat at the cost
+                              of slower rotations.
 """
 
 from __future__ import annotations
@@ -120,7 +131,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "2.3.0"
+_SHIM_VERSION = "2.3.1"
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +614,158 @@ def _load_backends() -> tuple[list[Backend], Backend | None]:
 
 
 # ---------------------------------------------------------------------------
+# v2.3.1 — backends.json hot-reload (credential rotation, no Desktop restart)
+#
+# Companion to the v2.3.0 `shim_reload` MCP tool, which manually re-fetches
+# the tool catalogue from each backend. This piece handles the OTHER
+# rotation surface — credentials. Pre-2.3.1 a `pa_admin rotate <user>` on
+# the server forced the user to restart Claude Desktop before the shim
+# picked up the new key. The dashboard rotates in seconds; the multi-
+# minute Desktop restart was the slow link in the chain.
+#
+# Strategy: watch backends.json's mtime. On every tool call (with a 2-
+# second throttle) re-stat the file; if mtime changed, re-read + apply
+# key/url/header in place on the existing Backend objects. Backend
+# .http_client() reads self.key fresh on every build, so the next request
+# already carries the new credential. No restart, no `shim_reload` call
+# from the user.
+#
+# What's hot-applied: KEY (the rotation case), URL, HEADER on a backend
+# whose name was already known at startup.
+#
+# What still needs Desktop restart OR `shim_reload`: adding a backend,
+# removing one, renaming one. (The first two also require an updated
+# tool registry; `shim_reload` covers the gain/lose-tools case.) Logged
+# at WARN.
+#
+# Defenses against transient half-written files:
+#   * JSONDecodeError → log + skip; do NOT advance the tracked mtime so
+#     the next throttle window picks up the eventual valid write.
+#   * empty key in the new file → treated as "no change" (don't blow
+#     away a good in-memory key on a transient empty during edit).
+#   * placeholder-key guard from v2.2.7 still applies on the load path.
+#
+# Throttle: PUNCH_SHIM_RELOAD_INTERVAL_S (default 2). Single stat call;
+# only a real mtime delta triggers the JSON re-read.
+
+import threading
+
+_BACKENDS_FILE_MTIME: float = 0.0
+_BACKENDS_RELOAD_LOCK = threading.Lock()
+_BACKENDS_RELOAD_THROTTLE_S = float(os.getenv("PUNCH_SHIM_RELOAD_INTERVAL_S", "2"))
+_LAST_RELOAD_CHECK_MONO: float = 0.0
+
+
+def _reconcile_backends(existing: list[Backend], new: list[Backend]) -> dict:
+    """Pure: apply key/url/header from `new` onto matching entries in
+    `existing` IN PLACE. Returns a summary of what changed. Backends in
+    `new` whose name doesn't appear in `existing` are NOT added (FastMCP
+    needs a `shim_reload` or restart for that); they show up under
+    'added' so the caller can log a structural-change warning. Same for
+    'removed'."""
+    existing_by_name = {b.name: b for b in existing}
+    new_by_name      = {b.name: b for b in new}
+
+    rotated_keys:   list[str] = []
+    url_changes:    list[str] = []
+    header_changes: list[str] = []
+
+    for name, new_b in new_by_name.items():
+        cur = existing_by_name.get(name)
+        if cur is None:
+            continue
+        # An empty key in the new file is treated as "no change" rather
+        # than a deliberate revoke — the shim has no other auth path,
+        # and a half-written file mid-edit could briefly carry "" before
+        # the real key lands. _maybe_reload_backends will retry on the
+        # next mtime tick if the file is still mid-edit.
+        if cur.key != new_b.key and new_b.key:
+            cur.key = new_b.key
+            rotated_keys.append(name)
+        if cur.url != new_b.url and new_b.url:
+            cur.url = new_b.url
+            url_changes.append(name)
+        if cur.header != new_b.header and new_b.header:
+            cur.header = new_b.header
+            header_changes.append(name)
+
+    return {
+        "added":          sorted(set(new_by_name) - set(existing_by_name)),
+        "removed":        sorted(set(existing_by_name) - set(new_by_name)),
+        "rotated_keys":   rotated_keys,
+        "url_changes":    url_changes,
+        "header_changes": header_changes,
+    }
+
+
+def _maybe_reload_backends() -> None:
+    """Cheap mtime check. If backends.json has changed, reload + reconcile
+    in-place onto the module-level `_BACKENDS`. Throttled to one check
+    per PUNCH_SHIM_RELOAD_INTERVAL_S to keep the stat call out of every
+    tool invocation's hot path. Safe to call from any thread."""
+    global _LAST_RELOAD_CHECK_MONO, _BACKENDS_FILE_MTIME
+
+    now = time.monotonic()
+    if now - _LAST_RELOAD_CHECK_MONO < _BACKENDS_RELOAD_THROTTLE_S:
+        return
+    _LAST_RELOAD_CHECK_MONO = now
+
+    cfg_path = _resolve_backends_path()
+    if not cfg_path.exists():
+        return
+
+    try:
+        mtime = cfg_path.stat().st_mtime
+    except OSError:
+        return
+    if mtime == _BACKENDS_FILE_MTIME:
+        return  # no change
+
+    with _BACKENDS_RELOAD_LOCK:
+        # Re-check inside the lock so racing threads don't double-load.
+        if mtime == _BACKENDS_FILE_MTIME:
+            return
+        try:
+            new_backends, _new_primary = _load_backends_from_file(cfg_path)
+        except Exception as e:
+            # Half-written file mid-edit, malformed JSON, etc. Don't
+            # advance _BACKENDS_FILE_MTIME so the NEXT throttle window
+            # retries (the throttle counter advanced — we won't busy-loop).
+            _log_event(
+                "backends_hot_reload_failed",
+                level=logging.WARNING,
+                error=f"{type(e).__name__}: {e}",
+                note="will retry on next throttle window",
+            )
+            return
+
+        summary = _reconcile_backends(_BACKENDS, new_backends)
+        _BACKENDS_FILE_MTIME = mtime
+
+        if (summary["rotated_keys"] or summary["url_changes"]
+                or summary["header_changes"]):
+            _log_event(
+                "backends_hot_reloaded",
+                mtime=mtime,
+                key_rotations=summary["rotated_keys"],
+                url_changes=summary["url_changes"],
+                header_changes=summary["header_changes"],
+                note="changes applied in-place; the next request uses new credentials",
+            )
+        if summary["added"] or summary["removed"]:
+            _log_event(
+                "backends_structural_change_detected",
+                level=logging.WARNING,
+                added=summary["added"],
+                removed=summary["removed"],
+                note=("structural changes (add/remove backend) are NOT hot-applied — "
+                      "call shim_reload to re-fetch tool catalogues, or restart "
+                      "Claude Desktop. Only key/url/header on existing backends "
+                      "are hot-applied here."),
+            )
+
+
+# ---------------------------------------------------------------------------
 # Bundled tools.json reader (kept from v2.2.2 — last-known-good fallback
 # for the SAP backend specifically when offline)
 # ---------------------------------------------------------------------------
@@ -641,6 +804,22 @@ def _bundled_server_version() -> str | None:
 # ---------------------------------------------------------------------------
 
 _BACKENDS, _PRIMARY = _load_backends()
+
+
+# v2.3.1: prime the hot-reload mtime tracker so the FIRST throttle window
+# after startup doesn't spuriously decide the file changed (which would
+# cost a no-op reload on the first tool call).
+def _init_backends_file_mtime() -> None:
+    global _BACKENDS_FILE_MTIME
+    cfg_path = _resolve_backends_path()
+    try:
+        if cfg_path.exists():
+            _BACKENDS_FILE_MTIME = cfg_path.stat().st_mtime
+    except OSError:
+        pass
+
+
+_init_backends_file_mtime()
 
 
 _log_event(
@@ -1009,6 +1188,10 @@ def _reload_registry() -> tuple[
 def _call_remote(registered_name: str, kwargs: dict) -> str:
     """Forward the call to the backend that owns this registered name.
     Returns a JSON string for MCP."""
+    # v2.3.1: cheap mtime check on backends.json. If the operator
+    # rotated the user's key on the server, the next request after
+    # the file lands picks up the new key — no Claude Desktop restart.
+    _maybe_reload_backends()
     entry = _NAME_TO_BACKEND.get(registered_name)
     if entry is None:
         _log_event("tool_call_unknown", level=logging.ERROR,

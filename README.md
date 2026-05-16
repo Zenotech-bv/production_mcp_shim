@@ -17,8 +17,9 @@ Desktop bounce, verify the sha256, and apply if newer.
 
 | File | Role |
 |---|---|
-| `shim_server.py` | The canonical shim source. One file, ~700 lines. |
+| `shim_server.py` | The canonical shim source. One file, ~1200 lines. |
 | `manifest.json` | Version + sha256 + size + release timestamp. The shim reads this first to decide whether an update is available. |
+| `tests/` | Hermetic pytest suite. `pytest tests/` to run. |
 
 The `manifest.json` `sha256` field MUST equal the sha256 of
 `shim_server.py`. CI / pre-commit hooks should enforce this — if
@@ -62,6 +63,44 @@ The shim's `_maybe_self_update()` runs on startup if
   shim_server.py` followed by a Claude Desktop restart.
 - **Two trust gradients**: GitHub HTTPS (this repo, primary) +
   internal server X-Punch-Auth (fallback). Either is sufficient.
+
+## Hot-reload of `backends.json` (v2.3.1)
+
+A key rotation on the server (`pa_admin rotate <user>`) used to force a
+full Claude Desktop restart on the user's laptop before the shim picked
+up the new key. The dashboard rotates in seconds; the multi-minute
+restart was the slow link in the auth flow.
+
+Companion to v2.3.0's `shim_reload` MCP tool — that one handles tools-
+list changes; this one handles credential rotations. Together they
+cover both rotation surfaces without a Desktop restart.
+
+The shim watches `backends.json`'s mtime. On every tool call (with a
+2-second throttle) it re-stat's the file; if mtime changed it re-reads,
+validates, and reconciles `key` / `url` / `header` onto the existing
+`Backend` objects in place. The next request after the rotation
+already carries the new key. **No Claude Desktop restart, no manual
+`shim_reload` call.**
+
+What's hot-applied: `key`, `url`, `header` on a backend whose `name`
+was already known at startup.
+
+What still needs `shim_reload` (added/removed tools) or Claude Desktop
+restart (added/removed/renamed backend): structural changes to the
+backend list. The shim logs a `backends_structural_change_detected`
+WARN event so the operator sees a clear signal.
+
+Tunables:
+
+| env var | default | what it does |
+|---|---|---|
+| `PUNCH_SHIM_RELOAD_INTERVAL_S` | `2` | seconds between mtime checks. Set to `0` to check on every call (handy for tests). The check is a single stat call; only an actual delta triggers the JSON re-read. |
+
+Atomic-write defenses: a malformed file (mid-edit JSON-decode error)
+is logged + skipped without advancing the tracked mtime, so the next
+throttle window picks up the eventual valid write. An empty `key` in
+the new file is treated as "no change" — protects against a transient
+half-written state.
 
 ## Override
 
