@@ -20,7 +20,12 @@
 
 [CmdletBinding()]
 param(
-    [string] $BaseRelease = '2.2.6',
+    # Baseline default tracks the most recent shipped .mcpb so the
+    # pyproject.toml deps (which get mirrored into the new .mcpb's
+    # server/requirements.txt) stay current. If you build off an older
+    # baseline you will silently drop any dep added since that release —
+    # the script can't see deps that aren't in the baseline's pyproject.
+    [string] $BaseRelease = '2.4.1',
     [string] $Version     = '',   # if empty, derive from _SHIM_VERSION in shim_server.py
     [switch] $DryRun
 )
@@ -99,4 +104,31 @@ $size = (Get-Item $outMcpb).Length
 Ok "Built $outMcpb ($size bytes)"
 
 Remove-Item -Recurse -Force $staging
-if ($DryRun) { Note "Dry-run: artifact lives in $env:TEMP, not committed to releases/" }
+
+# Sync the top-level auto-update manifest.json to match the current
+# shim_server.py — otherwise a laptop that fetches the manifest after
+# a shim_server.py bump but before someone hand-edits the manifest
+# would either refuse the new shim (sha mismatch) or believe it's still
+# on the old version. Same file matt would otherwise hand-edit; this
+# just spares him the bookkeeping.
+if (-not $DryRun) {
+    Step "Sync top-level manifest.json for auto-update"
+    $topManPath = Join-Path $repoRoot 'manifest.json'
+    if (Test-Path $topManPath) {
+        $topMan = Get-Content -Raw $topManPath | ConvertFrom-Json
+        $shimBytes = [System.IO.File]::ReadAllBytes($canonical)
+        $shimSha   = (Get-FileHash -Algorithm SHA256 -Path $canonical).Hash.ToLower()
+        $shimSize  = $shimBytes.Length
+        $topMan.version     = $Version
+        $topMan.sha256      = $shimSha
+        $topMan.size_bytes  = $shimSize
+        $topMan.released_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $topManJson = ($topMan | ConvertTo-Json -Depth 10) + "`n"
+        [System.IO.File]::WriteAllText($topManPath, $topManJson, [System.Text.UTF8Encoding]::new($false))
+        Ok "manifest.json (top-level / auto-update) synced: v$Version  sha=$($shimSha.Substring(0,12))...  size=$shimSize"
+    } else {
+        Note "(top-level manifest.json not found at $topManPath — skipped)"
+    }
+} else {
+    Note "Dry-run: artifact lives in $env:TEMP, not committed to releases/; top-level manifest.json NOT touched"
+}
