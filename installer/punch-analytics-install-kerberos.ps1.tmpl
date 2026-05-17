@@ -1,0 +1,203 @@
+# ============================================================================
+# Punch Analytics -- one-click installer (Kerberos / human user)
+#
+# Issued for users with a pa_users row keyed on aad_upn. NO API KEY is
+# embedded in this file -- the user authenticates via their Windows
+# logon ticket on every request. Safe to forward over Teams / email
+# without out-of-band secret delivery.
+#
+#   user        : {{USERNAME}}
+#   upn         : {{UPN}}
+#   generated   : {{GENERATED_AT}}
+#   server      : {{SERVER_URL}}
+#   mcpb        : {{MCPB_VERSION}} ({{MCPB_URL}})
+#   shim repo   : {{SHIM_REPO_URL}}
+# ============================================================================
+
+$ErrorActionPreference = 'Stop'
+
+# Embedded by the supervisor at render time.
+$Username     = '{{USERNAME}}'
+$Upn          = '{{UPN}}'
+$ServerUrl    = '{{SERVER_URL}}'
+$McpbUrl      = '{{MCPB_URL}}'
+$McpbVersion  = '{{MCPB_VERSION}}'
+$ShimRepoUrl  = '{{SHIM_REPO_URL}}'
+
+function Section($s){ Write-Host ""; Write-Host "=== $s ===" -ForegroundColor Cyan }
+function OK($s)     { Write-Host "  [OK] $s" -ForegroundColor Green }
+function Note($s)   { Write-Host "  $s" -ForegroundColor Gray }
+function Warn($s)   { Write-Host "  [..] $s" -ForegroundColor Yellow }
+function Fail($s)   { Write-Host "  [!!] $s" -ForegroundColor Red }
+function PauseExit($code){
+  Write-Host ""
+  if($Host.Name -eq 'ConsoleHost'){ Read-Host "Press Enter to close this window" | Out-Null }
+  exit $code
+}
+
+Write-Host ""
+Write-Host "  Punch Analytics MCP installer (Kerberos)" -ForegroundColor White
+Write-Host "  user: $Username  ($Upn)" -ForegroundColor White
+Write-Host ""
+
+# ----------------------------------------------------------------------------
+# 1. Sanity checks
+# ----------------------------------------------------------------------------
+Section "Checking prerequisites"
+
+# Claude Desktop. The MCPB extension format is Claude-Desktop-specific,
+# so without it there's nothing to install into.
+$claudeExe = Join-Path $env:LOCALAPPDATA "AnthropicClaude\Claude.exe"
+if(-not (Test-Path $claudeExe)){
+  $claudeExeAlt = Join-Path $env:LOCALAPPDATA "Programs\AnthropicClaude\Claude.exe"
+  if(Test-Path $claudeExeAlt){ $claudeExe = $claudeExeAlt }
+}
+if(-not (Test-Path $claudeExe)){
+  Fail "Claude Desktop not found."
+  Note "Install it from https://claude.ai/download, then re-run this installer."
+  PauseExit 1
+}
+OK "Claude Desktop found ($claudeExe)"
+
+# Domain membership. Kerberos needs a domain controller reachable AND the
+# machine to be a member of one. Off-corporate-network this fails.
+$domainOk = $false
+try {
+  $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+  if($cs.PartOfDomain){
+    OK "Machine is domain-joined to $($cs.Domain)"
+    $domainOk = $true
+  } else {
+    Warn "Machine is NOT domain-joined. Kerberos auth will not work."
+    Note "Workgroup machines can't get Kerberos tickets. Talk to IT or use a VPN."
+  }
+} catch {
+  Warn "Could not determine domain membership: $($_.Exception.Message)"
+}
+
+# We do NOT require admin. %APPDATA% and %TEMP% are writable as user.
+
+# ----------------------------------------------------------------------------
+# 2. Detect prior shim install
+# ----------------------------------------------------------------------------
+$punchDir     = Join-Path $env:APPDATA "Punch"
+$backendsFile = Join-Path $punchDir "backends.json"
+$shimAlreadyInstalled = Test-Path $backendsFile
+
+# ----------------------------------------------------------------------------
+# 3. Write/merge backends.json -- Kerberos flavour (no key)
+# ----------------------------------------------------------------------------
+Section "Writing $backendsFile"
+
+if(-not (Test-Path $punchDir)){
+  New-Item -ItemType Directory -Path $punchDir -Force | Out-Null
+}
+
+# Preserve any extra backends the user might have added by hand.
+$existing = $null
+if($shimAlreadyInstalled){
+  try { $existing = Get-Content -Raw -LiteralPath $backendsFile | ConvertFrom-Json } catch { $existing = $null }
+}
+
+# Two backends today: SAP analytics on :3000 and Zabbix adapter on :3002.
+# Both go through the same hostname; both use Kerberos. No header/key
+# fields -- those are explicitly absent for negotiate-mode backends, and
+# the v2.4+ shim sends Authorization: Negotiate built from the user's
+# Windows logon ticket via SSPI.
+function NewEntry($name, $port){
+  [ordered]@{
+    name = $name
+    url  = ($ServerUrl -replace ':\d+$', '') + ":$port"
+    auth = 'negotiate'
+  }
+}
+
+$serverHostUrl = $ServerUrl -replace ':\d+$', ''   # strip the trailing port
+$desired = @{
+  'sap'    = (NewEntry 'sap'    3000)
+  'zabbix' = (NewEntry 'zabbix' 3002)
+}
+
+$merged = [ordered]@{}
+if($existing -and $existing.backends){
+  foreach($b in $existing.backends){
+    if($b -and $b.name){
+      # If an existing entry for one of our names is on the old
+      # X-Punch-Auth flow (has 'header'/'key'), replace it. Otherwise
+      # preserve user-added backends untouched.
+      if($desired.ContainsKey($b.name)){ continue }
+      $merged[$b.name] = $b
+    }
+  }
+}
+foreach($k in $desired.Keys){ $merged[$k] = $desired[$k] }
+
+$primary = "sap"
+if($existing -and $existing.primary){ $primary = $existing.primary }
+
+$config = [ordered]@{
+  backends = @($merged.Values)
+  primary  = $primary
+}
+
+# Atomic write: stage to .tmp then Move-Item -Force.
+$tmp = "$backendsFile.tmp"
+$config | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $tmp -Encoding UTF8
+Move-Item -Force -LiteralPath $tmp -Destination $backendsFile
+OK "backends.json written ($($merged.Count) backend(s); sap + zabbix on Kerberos)"
+
+# ----------------------------------------------------------------------------
+# 4. Install the MCPB extension if absent
+# ----------------------------------------------------------------------------
+if(-not $shimAlreadyInstalled){
+  Section "Installing the Punch Analytics MCPB extension"
+  Warn "Claude Desktop will pop up an 'Install Punch Analytics?' dialog."
+  Note "Click Install. The dialog only appears the first time."
+
+  $tmpMcpb = Join-Path $env:TEMP ("punch-analytics-" + $McpbVersion + ".mcpb")
+  Note "Downloading $McpbUrl"
+  try {
+    Invoke-WebRequest -Uri $McpbUrl -OutFile $tmpMcpb -UseBasicParsing
+  } catch {
+    Fail "Download failed: $($_.Exception.Message)"
+    Note "Check the URL is reachable from this network, then re-run."
+    PauseExit 2
+  }
+  OK "Downloaded to $tmpMcpb"
+
+  Start-Process -FilePath $tmpMcpb
+  Note "Once you click Install in the dialog, restart Claude Desktop."
+  Note "After the restart, Punch Analytics tools appear in the tool palette."
+} else {
+  Section "MCPB already installed"
+  OK "Skipping download -- existing install detected."
+  Note "If you want to force a fresh MCPB version, delete %APPDATA%\Punch\backends.json"
+  Note "and re-run this installer (your custom backends will be merged back in)."
+}
+
+# ----------------------------------------------------------------------------
+# 5. Done
+# ----------------------------------------------------------------------------
+Section "Installer finished"
+OK "All done for $Username."
+Note ""
+Note "What happens next:"
+if(-not $shimAlreadyInstalled){
+  Note "  1. Approve the 'Install Punch Analytics?' dialog in Claude Desktop."
+  Note "  2. Restart Claude Desktop."
+  Note "  3. Try a tool, e.g. 'Using the pa_ tools, list my SAP company codes.'"
+} else {
+  Note "  1. Restart Claude Desktop (or wait ~2s for hot-reload to pick up the new config)."
+  Note "  2. Try a tool, e.g. 'Using the pa_ tools, list my SAP company codes.'"
+}
+Note ""
+Note "There is no key on disk. You authenticate via your Windows logon"
+Note "ticket every time. If the tools fail with 401, you might be off the"
+Note "corporate network (VPN solves it) or your UPN ($Upn) doesn't match"
+Note "the pa_users row -- ping the admin to verify."
+if(-not $domainOk){
+  Note ""
+  Warn "Reminder: this machine is not domain-joined. Kerberos will fail."
+}
+
+PauseExit 0
