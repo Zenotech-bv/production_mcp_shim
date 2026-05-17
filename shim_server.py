@@ -52,25 +52,38 @@ continues. The shim is healthy as long as ONE backend responds.
 
 ## Config file schema
 
-```json
+```jsonc
 {
   "backends": [
     {
       "name":   "sap",
       "url":    "http://mcp.punchpowertrain.com:3000",
-      "header": "X-Punch-Auth",
-      "key":    "..."
+      "auth":   "negotiate"
+      // v2.4.0 default for humans. No "header" or "key" needed — the
+      // shim sends Authorization: Negotiate <token> built from the
+      // calling user's Windows logon ticket via SSPI/pyspnego.
     },
     {
-      "name":   "tempo",
-      "url":    "http://tempo-mcp.punchpowertrain.com:3000",
+      "name":   "supervisor-webhook",
+      "url":    "http://mcp.punchpowertrain.com:3000",
+      "auth":   "x-punch-auth",
       "header": "X-Punch-Auth",
-      "key":    "..."
+      "key":    "<service-account key>"
     }
   ],
   "primary": "sap"
 }
 ```
+
+The optional ``auth`` field selects the auth mode per backend:
+
+  - ``"negotiate"`` — Kerberos/SPNEGO via Windows SSPI; no key on disk.
+    Requires a domain-joined laptop and a server-side SPN for the
+    backend's hostname.
+  - ``"x-punch-auth"`` — legacy API-key path; the key lives in ``"key"``.
+
+If ``"auth"`` is omitted, the shim defaults to ``"x-punch-auth"`` so
+existing pre-v2.4.0 config files keep working unchanged.
 
 The optional ``primary`` field names which backend's URL is used for
 auto-update fallback (when GitHub is unreachable). Defaults to the
@@ -116,10 +129,12 @@ import shutil
 import sys
 import tempfile
 import time
+import base64
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator
+from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
@@ -131,7 +146,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "2.3.1"
+_SHIM_VERSION = "2.4.0"
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +330,46 @@ def _log_event(event: str, level: int = logging.INFO, **fields):
 # ---------------------------------------------------------------------------
 
 
+_VALID_AUTH_MODES = ("x-punch-auth", "negotiate")
+
+
+class NegotiateAuth(httpx.Auth):
+    """SPNEGO/Kerberos `Authorization: Negotiate` for httpx, via pyspnego + SSPI.
+
+    Mints a fresh Negotiate token from the calling user's Windows logon
+    ticket on every request — matches the shim's max_keepalive_connections=0
+    stance (no socket pooling, no auth context reuse). The two-step path
+    handles the rare case where the server responds 401 with a continuation
+    token (NTLM-fallback or multi-leg Kerberos)."""
+
+    def __init__(self, hostname: str):
+        self._hostname = hostname
+
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        import spnego  # local import: only loaded when a negotiate backend is used
+        ctx = spnego.client(hostname=self._hostname, service="HTTP", protocol="negotiate")
+        out_token = ctx.step()
+        if out_token:
+            request.headers["Authorization"] = f"Negotiate {base64.b64encode(out_token).decode('ascii')}"
+        response = yield request
+        # Continuation path. Only act on a 401 carrying a Negotiate
+        # challenge with an embedded token; otherwise we're done.
+        while response.status_code == 401:
+            challenge = response.headers.get("WWW-Authenticate", "")
+            scheme, _, b64_in = challenge.partition(" ")
+            if scheme.lower() != "negotiate" or not b64_in:
+                return
+            try:
+                in_token = base64.b64decode(b64_in)
+            except (ValueError, TypeError):
+                return
+            out_token = ctx.step(in_token)
+            if not out_token:
+                return
+            request.headers["Authorization"] = f"Negotiate {base64.b64encode(out_token).decode('ascii')}"
+            response = yield request
+
+
 @dataclass
 class Backend:
     """One backend MCP server. Each backend has its own URL + auth +
@@ -323,6 +378,10 @@ class Backend:
     url: str
     header: str
     key: str
+    # v2.4.0 — per-backend auth mode. "x-punch-auth" (default; sends the
+    # header+key) or "negotiate" (Kerberos via the user's Windows logon
+    # ticket, no key on disk).
+    auth: str = "x-punch-auth"
     # Filled in at fetch time; empty until _load_tools_multi runs.
     tools: list[dict] = field(default_factory=list)
 
@@ -332,9 +391,20 @@ class Backend:
         # to it. Don't crash here; the fetch step will skip it and
         # log a warning.
         self.key = self.key.strip() if isinstance(self.key, str) else ""
+        self.auth = self.auth.strip().lower() if isinstance(self.auth, str) else "x-punch-auth"
+        if self.auth not in _VALID_AUTH_MODES:
+            # Unknown mode -> log+default. Same posture as a missing key:
+            # don't crash the shim, just mark this backend unusable.
+            _log_event("backend_unknown_auth_mode", level=logging.WARNING,
+                       backend=self.name, auth=self.auth,
+                       valid_modes=list(_VALID_AUTH_MODES))
+            self.auth = "x-punch-auth"  # safe-fail; is_configured will catch missing key
 
     @property
     def is_configured(self) -> bool:
+        if self.auth == "negotiate":
+            # No key required — the Windows logon ticket is the credential.
+            return bool(self.url)
         return bool(self.url and self.key and self.header)
 
     def http_client(self, *, read_timeout: float | None = None) -> httpx.Client:
@@ -344,26 +414,42 @@ class Backend:
           - max_keepalive_connections=0 (no socket pooling across calls)
           - Connection: close header (server closes after response)
           - connect=5.0s (fail fast on unreachable backend)
+
+        v2.4.0 — when self.auth == "negotiate", attaches a NegotiateAuth
+        and omits the X-Punch-Auth header. Otherwise (default
+        "x-punch-auth") behaves exactly as before.
         """
         rt = read_timeout if read_timeout is not None else PUNCH_SAP_TIMEOUT
         timeouts = httpx.Timeout(connect=5.0, read=rt, write=10.0, pool=5.0)
         limits = httpx.Limits(max_keepalive_connections=0, max_connections=10)
         bundled_v = _bundled_server_version() or "unknown"
+        headers: dict[str, str] = {
+            "Content-Type": "application/json",
+            "Connection": "close",
+            "User-Agent": f"punch-shim/{_SHIM_VERSION}",
+            "X-Punch-Shim-Backend": self.name,
+            "X-Punch-Shim-Bundled-Version": bundled_v,
+            "X-Punch-Shim-Version": _SHIM_VERSION,
+            "X-Punch-Shim-Pid": str(os.getpid()),
+        }
+        auth: httpx.Auth | None = None
+        if self.auth == "negotiate":
+            host = urlparse(self.url).hostname
+            if not host:
+                raise ValueError(
+                    f"backend {self.name!r}: auth=negotiate requires a "
+                    f"URL with a hostname; got {self.url!r}"
+                )
+            auth = NegotiateAuth(host)
+        else:
+            headers[self.header] = self.key
         return httpx.Client(
             base_url=self.url,
             timeout=timeouts,
             limits=limits,
             verify=_verify_tls,
-            headers={
-                self.header: self.key,
-                "Content-Type": "application/json",
-                "Connection": "close",
-                "User-Agent": f"punch-shim/{_SHIM_VERSION}",
-                "X-Punch-Shim-Backend": self.name,
-                "X-Punch-Shim-Bundled-Version": bundled_v,
-                "X-Punch-Shim-Version": _SHIM_VERSION,
-                "X-Punch-Shim-Pid": str(os.getpid()),
-            },
+            auth=auth,
+            headers=headers,
         )
 
 
@@ -411,16 +497,12 @@ def _load_backends_from_file(path: Path) -> tuple[list[Backend], str | None]:
         url = (entry.get("url") or "").strip()
         header = (entry.get("header") or "X-Punch-Auth").strip()
         key = (entry.get("key") or "").strip()
-        # v2.2.7 -- placeholder-key guard at file-load time. If the file
-        # contains a test-fixture or otherwise-placeholder key (the
-        # specific class of contamination caused by an earlier shim's
-        # module-level _load_backends() picking up `PUNCH_SAP_KEY=
-        # test-fixture-key` from a pytest import context), drop the
-        # key here so the rest of the shim falls through to the
-        # env-var fallback path. Logs LOUDLY -- the goal is for a
-        # contaminated user to see a clear signal in their server.log
-        # without having to inspect backends.json by hand.
-        if key and _looks_like_placeholder(key):
+        # v2.4.0 -- per-backend auth mode. Default is x-punch-auth so
+        # existing pre-v2.4.0 backends.json files keep working unchanged.
+        auth = (entry.get("auth") or "x-punch-auth").strip().lower()
+        # v2.2.7 -- placeholder-key guard at file-load time. Skip for
+        # negotiate backends since they have no key field to scrutinise.
+        if auth != "negotiate" and key and _looks_like_placeholder(key):
             _log_event(
                 "backends_entry_placeholder_key",
                 level=logging.WARNING,
@@ -447,7 +529,7 @@ def _load_backends_from_file(path: Path) -> tuple[list[Backend], str | None]:
                        index=i, name=name, reason="duplicate_name")
             continue
         seen_names.add(name)
-        backends.append(Backend(name=name, url=url, header=header, key=key))
+        backends.append(Backend(name=name, url=url, header=header, key=key, auth=auth))
 
     primary = data.get("primary")
     if isinstance(primary, str) and primary in seen_names:
@@ -669,6 +751,7 @@ def _reconcile_backends(existing: list[Backend], new: list[Backend]) -> dict:
     rotated_keys:   list[str] = []
     url_changes:    list[str] = []
     header_changes: list[str] = []
+    auth_changes:   list[str] = []
 
     for name, new_b in new_by_name.items():
         cur = existing_by_name.get(name)
@@ -688,6 +771,11 @@ def _reconcile_backends(existing: list[Backend], new: list[Backend]) -> dict:
         if cur.header != new_b.header and new_b.header:
             cur.header = new_b.header
             header_changes.append(name)
+        # v2.4.0 — auth-mode flip (Kerberos cutover). Apply on any change;
+        # unlike key, an explicit different value is always meaningful.
+        if cur.auth != new_b.auth:
+            cur.auth = new_b.auth
+            auth_changes.append(name)
 
     return {
         "added":          sorted(set(new_by_name) - set(existing_by_name)),
@@ -695,6 +783,7 @@ def _reconcile_backends(existing: list[Backend], new: list[Backend]) -> dict:
         "rotated_keys":   rotated_keys,
         "url_changes":    url_changes,
         "header_changes": header_changes,
+        "auth_changes":   auth_changes,
     }
 
 
@@ -743,7 +832,7 @@ def _maybe_reload_backends() -> None:
         _BACKENDS_FILE_MTIME = mtime
 
         if (summary["rotated_keys"] or summary["url_changes"]
-                or summary["header_changes"]):
+                or summary["header_changes"] or summary["auth_changes"]):
             _log_event(
                 "backends_hot_reloaded",
                 mtime=mtime,

@@ -102,6 +102,67 @@ throttle window picks up the eventual valid write. An empty `key` in
 the new file is treated as "no change" — protects against a transient
 half-written state.
 
+## Authentication (v2.4.0)
+
+Each backend in `backends.json` declares its auth mode with the
+`"auth"` field. Two modes are supported:
+
+- **`"auth": "negotiate"`** — Kerberos/SPNEGO. The shim sends
+  `Authorization: Negotiate <token>` built from the calling user's
+  Windows logon ticket via SSPI (`pyspnego` under the hood). **No key
+  is stored on the laptop.** Requires a domain-joined machine and a
+  server-side SPN (`HTTP/<backend-host>`) registered against the
+  service account running the MCP server. This is the default for
+  human users from v2.4.0 onward.
+
+- **`"auth": "x-punch-auth"`** — Legacy API-key path. The shim sends
+  the key from the entry's `"key"` field in the `"header"` field's
+  HTTP header (default `X-Punch-Auth`). Used for service-identity
+  backends (e.g. a webhook caller) where Kerberos isn't an option.
+
+If the `"auth"` field is omitted, the shim defaults to `"x-punch-auth"`
+so existing pre-v2.4.0 `backends.json` files keep working unchanged.
+
+Example mixing both:
+
+```jsonc
+{
+  "backends": [
+    {
+      "name": "sap",
+      "url":  "http://mcp.punchpowertrain.com:3000",
+      "auth": "negotiate"
+    },
+    {
+      "name":   "supervisor-webhook",
+      "url":    "http://mcp.punchpowertrain.com:3000",
+      "auth":   "x-punch-auth",
+      "header": "X-Punch-Auth",
+      "key":    "<service-account key>"
+    }
+  ],
+  "primary": "sap"
+}
+```
+
+Auth-mode changes hot-reload like keys do — flipping a backend from
+`x-punch-auth` to `negotiate` takes effect on the next request after
+`PUNCH_SHIM_RELOAD_INTERVAL_S` (default 2 seconds) without a Claude
+Desktop restart.
+
+### Per-user onboarding (v2.4.0+ humans)
+
+A new human user is onboarded entirely on the server side; their
+laptop gets a `backends.json` that reuses their existing Windows
+identity:
+
+1. Admin: `pa-admin create alice --upn alice@punchpowertrain.com`
+2. Hand the user a `backends.json` (or installer template) with
+   `"auth": "negotiate"` on the appropriate entries.
+3. User opens Claude Desktop. Tools work.
+
+No key is ever generated or transmitted for human users on this path.
+
 ## Override
 
 Fork-friendly: set `PUNCH_SHIM_UPDATE_URL_BASE` in `shim.env` to
