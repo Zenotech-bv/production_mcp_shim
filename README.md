@@ -6,7 +6,9 @@ Canonical source for the Punch Analytics MCP stdio shim.
 
 A single-file Python shim that runs on each user's laptop and bridges
 stdio-MCP (Cowork / Claude Desktop / Claude Code) to the internal
-HTTP MCP server at `http://mcp.punchpowertrain.com:3000`.
+HTTP MCP server at `http://ai.punchpowertrain.com:3000` (v2; the v1
+server at `mcp.punchpowertrain.com` is reachable too but on its way
+out — keep an explicit `"url"` in your `backends.json` if you need it).
 
 This repository is the **canonical source** for the shim. Laptops
 with `PUNCH_SHIM_AUTO_UPDATE=1` set in their `shim.env` fetch
@@ -130,12 +132,12 @@ Example mixing both:
   "backends": [
     {
       "name": "sap",
-      "url":  "http://mcp.punchpowertrain.com:3000",
+      "url":  "http://ai.punchpowertrain.com:3000",
       "auth": "negotiate"
     },
     {
       "name":   "supervisor-webhook",
-      "url":    "http://mcp.punchpowertrain.com:3000",
+      "url":    "http://ai.punchpowertrain.com:3000",
       "auth":   "x-punch-auth",
       "header": "X-Punch-Auth",
       "key":    "<service-account key>"

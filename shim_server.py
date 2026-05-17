@@ -57,7 +57,7 @@ continues. The shim is healthy as long as ONE backend responds.
   "backends": [
     {
       "name":   "sap",
-      "url":    "http://mcp.punchpowertrain.com:3000",
+      "url":    "http://ai.punchpowertrain.com:3000",
       "auth":   "negotiate"
       // v2.4.0 default for humans. No "header" or "key" needed — the
       // shim sends Authorization: Negotiate <token> built from the
@@ -65,7 +65,7 @@ continues. The shim is healthy as long as ONE backend responds.
     },
     {
       "name":   "supervisor-webhook",
-      "url":    "http://mcp.punchpowertrain.com:3000",
+      "url":    "http://ai.punchpowertrain.com:3000",
       "auth":   "x-punch-auth",
       "header": "X-Punch-Auth",
       "key":    "<service-account key>"
@@ -91,7 +91,7 @@ first entry.
 
 ## Legacy env vars (still supported)
 
-    PUNCH_SAP_URL         — default http://mcp.punchpowertrain.com:3000
+    PUNCH_SAP_URL         — default http://ai.punchpowertrain.com:3000
     PUNCH_SAP_KEY         — per-user API key issued by the SAP admin
     PUNCH_SAP_TIMEOUT     — read-timeout seconds, default 300
     PUNCH_SAP_VERIFY_TLS  — "false" to skip TLS verification (internal CA)
@@ -146,7 +146,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "2.4.0"
+_SHIM_VERSION = "2.4.1"
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +162,7 @@ load_dotenv()  # also pick up a .env if the user keeps one
 # Legacy single-backend env vars — used as fallback when backends.json
 # is absent. Also used at module load before per-backend config is
 # resolved (e.g. shim_start log before we know which backend is primary).
-PUNCH_SAP_URL = os.getenv("PUNCH_SAP_URL", "http://mcp.punchpowertrain.com:3000").rstrip("/")
+PUNCH_SAP_URL = os.getenv("PUNCH_SAP_URL", "http://ai.punchpowertrain.com:3000").rstrip("/")
 PUNCH_SAP_KEY = os.getenv("PUNCH_SAP_KEY", "").strip()
 
 # v2.2.7 — placeholder-key guard. The shim's module-level _load_backends()
@@ -571,13 +571,13 @@ _DEFAULT_BACKENDS_TEMPLATE: dict = {
     "backends": [
         {
             "name":   "sap",
-            "url":    "http://mcp.punchpowertrain.com:3000",
-            "header": "X-Punch-Auth",
+            "url":    "http://ai.punchpowertrain.com:3000",
+            "auth":   "negotiate",
         },
         {
             "name":   "zabbix",
-            "url":    "http://mcp.punchpowertrain.com:3002",
-            "header": "X-Punch-Auth",
+            "url":    "http://ai.punchpowertrain.com:3002",
+            "auth":   "negotiate",
         },
     ],
     "primary": "sap",
