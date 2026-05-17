@@ -104,7 +104,7 @@ throttle window picks up the eventual valid write. An empty `key` in
 the new file is treated as "no change" — protects against a transient
 half-written state.
 
-## Authentication (v2.4.0)
+## Authentication (v3.0.0)
 
 Each backend in `backends.json` declares its auth mode with the
 `"auth"` field. Two modes are supported:
@@ -115,7 +115,7 @@ Each backend in `backends.json` declares its auth mode with the
   is stored on the laptop.** Requires a domain-joined machine and a
   server-side SPN (`HTTP/<backend-host>`) registered against the
   service account running the MCP server. This is the default for
-  human users from v2.4.0 onward.
+  human users from v3.0.0 onward.
 
 - **`"auth": "x-punch-auth"`** — Legacy API-key path. The shim sends
   the key from the entry's `"key"` field in the `"header"` field's
@@ -123,7 +123,7 @@ Each backend in `backends.json` declares its auth mode with the
   backends (e.g. a webhook caller) where Kerberos isn't an option.
 
 If the `"auth"` field is omitted, the shim defaults to `"x-punch-auth"`
-so existing pre-v2.4.0 `backends.json` files keep working unchanged.
+so existing pre-v3.0.0 `backends.json` files keep working unchanged.
 
 Example mixing both:
 
@@ -152,7 +152,7 @@ Auth-mode changes hot-reload like keys do — flipping a backend from
 `PUNCH_SHIM_RELOAD_INTERVAL_S` (default 2 seconds) without a Claude
 Desktop restart.
 
-### Per-user onboarding (v2.4.0+ humans)
+### Per-user onboarding (v3.0.0+ humans)
 
 A new human user is onboarded entirely on the server side; their
 laptop gets a `backends.json` that reuses their existing Windows

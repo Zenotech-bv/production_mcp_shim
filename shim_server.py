@@ -59,7 +59,7 @@ continues. The shim is healthy as long as ONE backend responds.
       "name":   "sap",
       "url":    "http://ai.punchpowertrain.com:3000",
       "auth":   "negotiate"
-      // v2.4.0 default for humans. No "header" or "key" needed — the
+      // v3.0.0 default for humans. No "header" or "key" needed — the
       // shim sends Authorization: Negotiate <token> built from the
       // calling user's Windows logon ticket via SSPI/pyspnego.
     },
@@ -83,7 +83,7 @@ The optional ``auth`` field selects the auth mode per backend:
   - ``"x-punch-auth"`` — legacy API-key path; the key lives in ``"key"``.
 
 If ``"auth"`` is omitted, the shim defaults to ``"x-punch-auth"`` so
-existing pre-v2.4.0 config files keep working unchanged.
+existing pre-v3.0.0 config files keep working unchanged.
 
 The optional ``primary`` field names which backend's URL is used for
 auto-update fallback (when GitHub is unreachable). Defaults to the
@@ -146,7 +146,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "0.3.0"
+_SHIM_VERSION = "3.0.0"
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +378,7 @@ class Backend:
     url: str
     header: str
     key: str
-    # v2.4.0 — per-backend auth mode. "x-punch-auth" (default; sends the
+    # v3.0.0 — per-backend auth mode. "x-punch-auth" (default; sends the
     # header+key) or "negotiate" (Kerberos via the user's Windows logon
     # ticket, no key on disk).
     auth: str = "x-punch-auth"
@@ -415,7 +415,7 @@ class Backend:
           - Connection: close header (server closes after response)
           - connect=5.0s (fail fast on unreachable backend)
 
-        v2.4.0 — when self.auth == "negotiate", attaches a NegotiateAuth
+        v3.0.0 — when self.auth == "negotiate", attaches a NegotiateAuth
         and omits the X-Punch-Auth header. Otherwise (default
         "x-punch-auth") behaves exactly as before.
         """
@@ -497,8 +497,8 @@ def _load_backends_from_file(path: Path) -> tuple[list[Backend], str | None]:
         url = (entry.get("url") or "").strip()
         header = (entry.get("header") or "X-Punch-Auth").strip()
         key = (entry.get("key") or "").strip()
-        # v2.4.0 -- per-backend auth mode. Default is x-punch-auth so
-        # existing pre-v2.4.0 backends.json files keep working unchanged.
+        # v3.0.0 -- per-backend auth mode. Default is x-punch-auth so
+        # existing pre-v3.0.0 backends.json files keep working unchanged.
         auth = (entry.get("auth") or "x-punch-auth").strip().lower()
         # v2.2.7 -- placeholder-key guard at file-load time. Skip for
         # negotiate backends since they have no key field to scrutinise.
@@ -771,7 +771,7 @@ def _reconcile_backends(existing: list[Backend], new: list[Backend]) -> dict:
         if cur.header != new_b.header and new_b.header:
             cur.header = new_b.header
             header_changes.append(name)
-        # v2.4.0 — auth-mode flip (Kerberos cutover). Apply on any change;
+        # v3.0.0 — auth-mode flip (Kerberos cutover). Apply on any change;
         # unlike key, an explicit different value is always meaningful.
         if cur.auth != new_b.auth:
             cur.auth = new_b.auth
@@ -1556,6 +1556,69 @@ async def shim_reload(ctx: Context) -> str:
 
 
 mcp.tool()(shim_reload)
+
+
+# ---------------------------------------------------------------------------
+# v3.0.0 — shim_info: self-report shim version + backend topology from
+# inside a Claude session. The shim already stamps X-Punch-Shim-Version
+# on every outbound request (servers audit it), but Claude can't ask the
+# shim "what version are you" without an MCP-tool path. This closes that
+# gap. Pure read-only: returns version + python info + per-backend
+# {url, auth, registered_tool_count, reachable}. Safe to call any time.
+# ---------------------------------------------------------------------------
+
+async def shim_info(ctx: Context) -> str:
+    """Report this shim's version, Python runtime, and per-backend
+    configuration to the Claude session. Useful for "what version is my
+    shim?" / "which backends are configured?" questions and for
+    troubleshooting (e.g. confirming auth=negotiate is set on the SAP
+    backend after a backends.json edit).
+
+    No side effects. Doesn't talk to any backend — uses the already-loaded
+    in-process registry.
+    """
+    try:
+        backends_payload: list[dict[str, Any]] = []
+        for b in _BACKENDS:
+            tool_count = sum(1 for _name, _tool, bk in _REGISTRATIONS if bk is b)
+            backends_payload.append({
+                "name":                   b.name,
+                "url":                    b.url,
+                "auth":                   b.auth,
+                "header":                 b.header if b.auth == "x-punch-auth" else None,
+                "configured":             b.is_configured,
+                "registered_tool_count":  tool_count,
+            })
+
+        # bundled_v: the version of pa_v2 the shim THINKS it's pinned to,
+        # via the bundled server-version file. Distinct from the live
+        # backend versions (which would require a /health probe and we
+        # deliberately don't do that here).
+        bundled_v = _bundled_server_version() or None
+
+        return json.dumps({
+            "shim_version":      _SHIM_VERSION,
+            "bundled_server":    bundled_v,
+            "python":            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            "platform":          sys.platform,
+            "pid":               os.getpid(),
+            "backends_file":     str(_resolve_backends_path()),
+            "primary_backend":   _PRIMARY.name if _PRIMARY else None,
+            "backend_count":     len(_BACKENDS),
+            "backends":          backends_payload,
+            "auto_update_enabled": _AUTO_UPDATE,
+        }, indent=2)
+    except Exception as e:
+        _log_event("shim_info_failed", level=logging.ERROR,
+                   error=f"{type(e).__name__}: {e}")
+        return json.dumps({
+            "shim_version":  _SHIM_VERSION,
+            "error_type":    type(e).__name__,
+            "message":       str(e),
+        }, indent=2)
+
+
+mcp.tool()(shim_info)
 
 
 # ---------------------------------------------------------------------------
