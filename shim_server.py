@@ -146,7 +146,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "3.0.1"
+_SHIM_VERSION = "3.0.2"
 
 
 # ---------------------------------------------------------------------------
@@ -585,8 +585,19 @@ _DEFAULT_BACKENDS_TEMPLATE: dict = {
 
 
 def _maybe_seed_backends_file(cfg_path: Path) -> bool:
-    """If cfg_path doesn't exist AND PUNCH_SAP_KEY is set, write a
-    default backends.json populated with that key for every backend.
+    """If cfg_path doesn't exist, write a default backends.json.
+
+    Two seed modes, branching on whether PUNCH_SAP_KEY is set:
+
+    * **Kerberos default** (no PUNCH_SAP_KEY env var): write the template
+      verbatim — every backend is `auth=negotiate`, no key on disk. Works
+      out of the box on a domain-joined laptop. This is the path a fresh
+      v3.0+ install with the API-key dialog field left blank lands on.
+
+    * **Service-identity fallback** (PUNCH_SAP_KEY is set): override the
+      template to `auth=x-punch-auth` and inject the env-var key into
+      every backend entry. Used by laptops whose only setup mode is the
+      env var (e.g. an installer .cmd that bakes the key in).
 
     Returns True if a file was written, False otherwise. Failures are
     swallowed -- a malformed cwd or read-only filesystem must not
@@ -595,16 +606,44 @@ def _maybe_seed_backends_file(cfg_path: Path) -> bool:
     """
     if cfg_path.exists():
         return False
-    if not PUNCH_SAP_KEY:
-        return False
-    # Build the seed payload from the template.
-    seed: dict = {
-        "backends": [
-            {**entry, "key": PUNCH_SAP_KEY}
-            for entry in _DEFAULT_BACKENDS_TEMPLATE["backends"]
-        ],
-        "primary": _DEFAULT_BACKENDS_TEMPLATE["primary"],
-    }
+
+    if PUNCH_SAP_KEY:
+        # Service-identity: override the template to x-punch-auth and
+        # bake the env-var key into every entry.
+        seed: dict = {
+            "backends": [
+                {
+                    "name":   entry["name"],
+                    "url":    entry["url"],
+                    "auth":   "x-punch-auth",
+                    "header": "X-Punch-Auth",
+                    "key":    PUNCH_SAP_KEY,
+                }
+                for entry in _DEFAULT_BACKENDS_TEMPLATE["backends"]
+            ],
+            "primary": _DEFAULT_BACKENDS_TEMPLATE["primary"],
+        }
+        seed_note = (
+            "first-run auto-create; PUNCH_SAP_KEY env var present so "
+            "every backend was seeded with auth=x-punch-auth and that "
+            "key. Edit the file to issue per-backend keys."
+        )
+    else:
+        # Kerberos default: template as-is, auth=negotiate, no key. Pre-
+        # v3.0 the absence of PUNCH_SAP_KEY would bail out here entirely
+        # and leave the user with zero backends; v3.0+ writes the
+        # Kerberos seed so the laptop is usable on first launch.
+        seed = {
+            "backends": [dict(entry) for entry in _DEFAULT_BACKENDS_TEMPLATE["backends"]],
+            "primary":  _DEFAULT_BACKENDS_TEMPLATE["primary"],
+        }
+        seed_note = (
+            "first-run auto-create; no PUNCH_SAP_KEY env var, so every "
+            "backend was seeded with auth=negotiate (Kerberos / SPNEGO "
+            "via the calling user's Windows logon ticket). Domain-joined "
+            "laptop + server-side SPN required."
+        )
+
     try:
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(json.dumps(seed, indent=2), encoding="utf-8")
@@ -622,10 +661,8 @@ def _maybe_seed_backends_file(cfg_path: Path) -> bool:
         backend_count=len(seed["backends"]),
         backend_names=[b["name"] for b in seed["backends"]],
         primary=seed["primary"],
-        note=(
-            "first-run auto-create; populated all backends with "
-            "PUNCH_SAP_KEY. Edit the file to issue per-backend keys."
-        ),
+        mode=("x-punch-auth" if PUNCH_SAP_KEY else "negotiate"),
+        note=seed_note,
     )
     return True
 
