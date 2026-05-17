@@ -99,6 +99,79 @@ def test_shim_info_reports_auto_update_state():
     assert payload["auto_update_enabled"] is False
 
 
+def test_shim_info_includes_process_env_diagnostics():
+    """v3.0.3 — shim_info reports the env vars the shim's process sees so
+    the operator can compare against what their shell sees. Catches the
+    'Claude Desktop launched the shim with a different APPDATA' class
+    of mystery in one tool call."""
+    shim = _import_shim()
+    payload = _call_shim_info(shim)
+    assert "process_env" in payload
+    env = payload["process_env"]
+    # The set of keys is the contract — change carefully.
+    expected_keys = {
+        "APPDATA", "LOCALAPPDATA", "USERPROFILE",
+        "PUNCH_BACKENDS_FILE", "PUNCH_SAP_URL", "PUNCH_SAP_KEY",
+        "PUNCH_SHIM_AUTO_UPDATE",
+    }
+    assert set(env.keys()) == expected_keys, (
+        f"process_env key set drift: got {set(env.keys())}, expected {expected_keys}"
+    )
+
+
+def test_shim_info_redacts_punch_sap_key_credential(monkeypatch):
+    """v3.0.3 — the credential MUST be reported as <set>/<unset>, never
+    echoed verbatim. Echoing it would leak a service-account key into
+    whatever chat the shim_info tool was called from. Belt-and-braces:
+    if someone later adds the raw value 'because it's useful for
+    debugging', this test fails loudly."""
+    shim = _import_shim()
+    secret = "do-not-leak-this-key-padded-to-look-real-xxxx"
+    monkeypatch.setenv("PUNCH_SAP_KEY", secret)
+
+    payload = _call_shim_info(shim)
+    env = payload["process_env"]
+    assert env["PUNCH_SAP_KEY"] == "<set>", (
+        f"PUNCH_SAP_KEY must be redacted, got {env['PUNCH_SAP_KEY']!r}"
+    )
+    # Whole-payload sweep: the literal secret must not appear anywhere.
+    import json as _json
+    raw = _json.dumps(payload)
+    assert secret not in raw, (
+        f"the literal PUNCH_SAP_KEY value leaked somewhere in the payload"
+    )
+
+
+def test_shim_info_punch_sap_key_unset_when_no_env(monkeypatch):
+    shim = _import_shim()
+    monkeypatch.delenv("PUNCH_SAP_KEY", raising=False)
+    payload = _call_shim_info(shim)
+    assert payload["process_env"]["PUNCH_SAP_KEY"] == "<unset>"
+
+
+def test_shim_info_reports_backends_file_exists_bool():
+    """v3.0.3 — explicit boolean alongside the resolved path, so the
+    operator doesn't have to do their own Test-Path. The path can
+    resolve fine but point at a directory that doesn't exist (which
+    is exactly the bug that motivated v3.0.3)."""
+    shim = _import_shim()
+    payload = _call_shim_info(shim)
+    assert "backends_file_exists" in payload
+    assert isinstance(payload["backends_file_exists"], bool)
+
+
+def test_shim_info_includes_cwd_and_script_dir():
+    shim = _import_shim()
+    payload = _call_shim_info(shim)
+    assert payload["cwd"]
+    assert payload["script_dir"]
+    assert payload["executable"]
+    # script_dir should match the shim_server.py's own directory
+    from pathlib import Path
+    expected_script_dir = str(Path(shim.__file__).parent)
+    assert payload["script_dir"] == expected_script_dir
+
+
 def test_shim_info_survives_introspection_failure_gracefully():
     """If iterating _BACKENDS / _REGISTRATIONS raises (corrupted state),
     shim_info should still return a JSON payload with at least the

@@ -146,7 +146,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "3.0.2"
+_SHIM_VERSION = "3.0.3"
 
 
 # ---------------------------------------------------------------------------
@@ -1633,17 +1633,38 @@ async def shim_info(ctx: Context) -> str:
         # deliberately don't do that here).
         bundled_v = _bundled_server_version() or None
 
+        # v3.0.3 — process-env diagnostics. Resolves the class of "shim
+        # is reading config from somewhere I don't expect" mysteries in
+        # one tool call instead of three PowerShell rounds. Sensitive
+        # values (PUNCH_SAP_KEY) reported as <set>/<unset>, never echoed
+        # verbatim — leaking a service-account key into a chat would be
+        # worse than the diagnostic value of showing it.
+        env_diagnostics = {
+            "APPDATA":              os.environ.get("APPDATA"),
+            "LOCALAPPDATA":         os.environ.get("LOCALAPPDATA"),
+            "USERPROFILE":          os.environ.get("USERPROFILE"),
+            "PUNCH_BACKENDS_FILE":  os.environ.get("PUNCH_BACKENDS_FILE"),
+            "PUNCH_SAP_URL":        os.environ.get("PUNCH_SAP_URL"),
+            "PUNCH_SAP_KEY":        "<set>" if os.environ.get("PUNCH_SAP_KEY") else "<unset>",
+            "PUNCH_SHIM_AUTO_UPDATE": os.environ.get("PUNCH_SHIM_AUTO_UPDATE"),
+        }
+        backends_file_path = _resolve_backends_path()
         return json.dumps({
-            "shim_version":      _SHIM_VERSION,
-            "bundled_server":    bundled_v,
-            "python":            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-            "platform":          sys.platform,
-            "pid":               os.getpid(),
-            "backends_file":     str(_resolve_backends_path()),
-            "primary_backend":   _PRIMARY.name if _PRIMARY else None,
-            "backend_count":     len(_BACKENDS),
-            "backends":          backends_payload,
-            "auto_update_enabled": _AUTO_UPDATE,
+            "shim_version":         _SHIM_VERSION,
+            "bundled_server":       bundled_v,
+            "python":               f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            "executable":           sys.executable,
+            "platform":             sys.platform,
+            "pid":                  os.getpid(),
+            "cwd":                  os.getcwd(),
+            "script_dir":           str(Path(__file__).parent),
+            "backends_file":        str(backends_file_path),
+            "backends_file_exists": backends_file_path.exists(),
+            "primary_backend":      _PRIMARY.name if _PRIMARY else None,
+            "backend_count":        len(_BACKENDS),
+            "backends":             backends_payload,
+            "auto_update_enabled":  _AUTO_UPDATE,
+            "process_env":          env_diagnostics,
         }, indent=2)
     except Exception as e:
         _log_event("shim_info_failed", level=logging.ERROR,
