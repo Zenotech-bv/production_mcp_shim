@@ -1,7 +1,7 @@
-"""v2.4.0 — per-backend auth mode in backends.json.
+"""v3.0.0 — per-backend auth mode in backends.json.
 
 Adds an `auth` field to each backend entry. Default is "x-punch-auth"
-so pre-v2.4.0 files keep working. "negotiate" mode swaps the
+so pre-v3.0.0 files keep working. "negotiate" mode swaps the
 X-Punch-Auth header for an httpx.Auth that mints a SPNEGO token via
 pyspnego + SSPI on every request.
 
