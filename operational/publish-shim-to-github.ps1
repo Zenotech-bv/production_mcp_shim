@@ -40,7 +40,12 @@ param(
     [switch] $NoGhRelease,            # skip the `gh release create` step
     [string] $BaseRelease = '2.4.1',  # forwarded to build-mcpb.ps1
     [string] $TagPrefix   = 'punch-analytics-v',
-    [string] $ReleaseTitle = ''       # if empty, generated from version
+    [string] $ReleaseTitle = '',      # if empty, generated from version
+    # v3.0.6 — forwarded to build-mcpb.ps1; updates the description text
+    # Claude Desktop shows in its Connector directory. Empty leaves the
+    # existing manifest values in place (back-compat).
+    [string] $Description     = '',
+    [string] $LongDescription = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -76,7 +81,10 @@ if ($SkipBuild) {
 } else {
     Step "Running build-mcpb.ps1"
     $buildScript = Join-Path $scriptDir 'build-mcpb.ps1'
-    & pwsh -NoProfile -File $buildScript -BaseRelease $BaseRelease
+    $buildArgs = @('-NoProfile','-File',$buildScript,'-BaseRelease',$BaseRelease)
+    if ($Description)     { $buildArgs += @('-Description',$Description) }
+    if ($LongDescription) { $buildArgs += @('-LongDescription',$LongDescription) }
+    & pwsh @buildArgs
     if ($LASTEXITCODE -ne 0) { Fail "build-mcpb.ps1 exited $LASTEXITCODE"; exit $LASTEXITCODE }
     if (-not (Test-Path $Mcpb)) { Fail "build-mcpb didn't produce $Mcpb"; exit 1 }
     Ok "Built $Mcpb"

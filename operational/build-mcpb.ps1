@@ -27,6 +27,13 @@ param(
     # the script can't see deps that aren't in the baseline's pyproject.
     [string] $BaseRelease = '2.4.1',
     [string] $Version     = '',   # if empty, derive from _SHIM_VERSION in shim_server.py
+    # v3.0.6 — description + long_description are no longer left frozen at
+    # whatever the baseline .mcpb shipped. Pass these per-release so the
+    # text Claude Desktop's Connector directory shows matches the version.
+    # If either is empty the field in the manifest is preserved as-is
+    # (back-compat with the pre-v3.0.6 pattern of hand-editing).
+    [string] $Description     = '',
+    [string] $LongDescription = '',
     [switch] $DryRun
 )
 
@@ -87,14 +94,64 @@ if ($depMatch.Success) {
     Note "pyproject.toml has no parseable dependencies array; leaving requirements.txt as-is"
 }
 
-Step "Bump manifest.json version"
+Step "Update manifest.json (version + descriptions + bundled-runtime flag)"
 $manPath = Join-Path $staging 'manifest.json'
 $man = Get-Content -Raw $manPath | ConvertFrom-Json
 $man.version = $Version
+
+# v3.0.6 — overwrite user_config.punch_sap_url.default (was frozen at
+# v1's mcp.punchpowertrain.com in the v2.4.1 baseline; v3.0.1 was
+# supposed to fix this but only hand-edited a single .mcpb, never
+# propagated back here, so every subsequent build silently re-introduced
+# the bad default. A fresh-install user on Joris's laptop 2026-05-18
+# saw the v1 URL prefilled and the shim then couldn't connect.)
+if ($man.user_config -and $man.user_config.punch_sap_url) {
+    $man.user_config.punch_sap_url.default = 'http://ai.punchpowertrain.com:3000'
+    Note "user_config.punch_sap_url.default -> http://ai.punchpowertrain.com:3000"
+}
+
+# v3.0.6 — flip user_config.punch_sap_key.required from true to false.
+# Pre-Kerberos the X-Punch-Auth header was the only auth path so this
+# being required made sense. Post-Kerberos cutover (v0.0.115/116 +
+# shim v3.0.0+) the default flow is Kerberos for humans + the install
+# dialog shouldn't force the user to type something into a field they
+# don't need — anything typed there ends up flipping the auto-seed's
+# branch from Kerberos to x-punch-auth, with a placeholder key that
+# 401s on every call.
+if ($man.user_config -and $man.user_config.punch_sap_key) {
+    $man.user_config.punch_sap_key.required = $false
+    # Description rewritten so the install dialog matches the new shape.
+    $man.user_config.punch_sap_key.description = 'OPTIONAL: only for service-account installs (headless callers that can''t carry a Windows ticket). Leave BLANK for human users — Kerberos/SPNEGO authenticates via your existing Windows logon. The shim''s auto-seed branches on this field: any value here triggers the X-Punch-Auth path; empty triggers Kerberos.'
+    Note "user_config.punch_sap_key.required -> false (Kerberos is the default)"
+}
+
+# v3.0.6 — overwrite description / long_description from caller args.
+# If the caller passed nothing (empty string), the existing manifest
+# value is preserved — back-compat with the pre-v3.0.6 pattern where
+# this script left description text frozen at the baseline.
+if ($Description) {
+    $man.description = $Description
+    Note "description updated"
+}
+if ($LongDescription) {
+    $man.long_description = $LongDescription
+    Note "long_description updated"
+}
+
+# v3.0.6 — strip `compatibility.runtimes.python`. The bundled `bin/uv.exe`
+# materializes its own Python on first launch, so declaring a system-level
+# Python requirement is wrong: Claude Desktop's MCPB installer reads this
+# field and warns/blocks if the user's machine doesn't have Python ≥3.10,
+# even though our shim doesn't need it. Surfaced on a fresh-install attempt
+# 2026-05-18 (kerberos-cutover follow-up).
+if ($man.compatibility -and $man.compatibility.runtimes -and $man.compatibility.runtimes.python) {
+    $man.compatibility.runtimes.PSObject.Properties.Remove('python')
+    Note "compatibility.runtimes.python removed (bundled via uv.exe)"
+}
+
 $manJson = ($man | ConvertTo-Json -Depth 10) + "`n"
 [System.IO.File]::WriteAllText($manPath, $manJson, [System.Text.UTF8Encoding]::new($false))
 Ok "manifest.json -> $Version"
-Note "(description / long_description NOT updated; edit by hand for a meaningful release)"
 
 Step "Re-zip"
 if (Test-Path $outMcpb) { Remove-Item -LiteralPath $outMcpb -Force }
