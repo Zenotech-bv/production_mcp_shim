@@ -146,7 +146,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "3.0.7"
+_SHIM_VERSION = "3.0.8"
 
 
 # ---------------------------------------------------------------------------
@@ -192,19 +192,16 @@ _PLACEHOLDER_KEY_PATTERNS = (
 )
 _MIN_REAL_KEY_LEN = 16  # real keys are 43+ chars; 16 is a generous floor
 
-# v3.0.7 — strict-shape real-key predicate. Used in two places:
-#   1. _maybe_seed_backends_file: only flip to the x-punch-auth seed branch
-#      when PUNCH_SAP_KEY plausibly IS a key (not install-dialog garbage).
-#   2. _looks_v2_stale_xpunch: at load time, a stored backend pointing at
-#      the canonical Kerberos host with an unreal-looking key is treated
-#      as a broken-install artifact (archive + re-seed).
-#
-# Permissive on purpose. False positive at LOAD time = silently archive
-# a real service-account user's config, which is awful UX. We let
-# anything in [A-Za-z0-9_+=/-]{16,128} pass as "could plausibly be a
-# real key produced by token_urlsafe / hex / base64 / similar." What we
-# reject is what an exhausted operator typed into the install dialog:
-# short strings, names, words with spaces or punctuation, random ASCII.
+# v3.0.7 — strict-shape real-key predicate. Used at seed time
+# (`_maybe_seed_backends_file`) to only flip to the x-punch-auth seed
+# branch when PUNCH_SAP_KEY plausibly IS a key (not install-dialog
+# garbage). v3.0.7 also wired this into a load-time auto-archive of
+# stale-xpunch backends; that was rolled back in v3.0.8 because it
+# couldn't catch wrong-host cases (e.g. an install with auth=x-punch-auth
+# pointed at the zabbix backend, off the canonical-Kerberos-host list)
+# without false-positives, and the deterministic `reset-punch.cmd`
+# covers every broken-state shape uniformly. Keep this predicate; it
+# remains the seed-time gate.
 _REAL_KEY_RE = re.compile(r"^[A-Za-z0-9_+=/-]{16,128}$")
 
 
@@ -622,17 +619,6 @@ _V1_HOSTS = frozenset({
     "mcp.punchpowertrain.com",
 })
 
-# v3.0.7 — canonical Kerberos hosts. Used by _looks_v2_stale_xpunch to
-# decide whether a stored `auth=x-punch-auth` backend with a placeholder-
-# looking key is the install-dialog-garbage trap (auto-archive) or a
-# legitimate service-account install at a different host (leave alone).
-# Kept in lockstep with _DEFAULT_BACKENDS_TEMPLATE — if you change the
-# template's URLs, extend this set too.
-_KERBEROS_HOSTS = frozenset({
-    "ai.punchpowertrain.com",
-})
-
-
 def _looks_v1_backend(backend: Backend) -> bool:
     """Return True if this backend's URL host is a known v1 host."""
     try:
@@ -640,76 +626,6 @@ def _looks_v1_backend(backend: Backend) -> bool:
     except (ValueError, AttributeError):
         return False
     return host in _V1_HOSTS
-
-
-def _file_has_v2_stale_xpunch(cfg_path: Path) -> bool:
-    """Read the raw backends.json and return True iff at least one entry
-    matches the v2-stale-xpunch shape on disk. Done at the JSON level
-    (not Backend level) because _load_backends_from_file already strips
-    placeholder-shaped keys at the v2.2.7 guard — by the time we have
-    Backend instances, the smoking-gun key value is gone."""
-    try:
-        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(raw, dict):
-        return False
-    entries = raw.get("backends")
-    if not isinstance(entries, list):
-        return False
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        url  = (entry.get("url")  or "").strip()
-        auth = (entry.get("auth") or "x-punch-auth").strip().lower()
-        key  = (entry.get("key")  or "").strip()
-        try:
-            host = (urlparse(url).hostname or "").lower()
-        except (ValueError, AttributeError):
-            continue
-        if host not in _KERBEROS_HOSTS:
-            continue
-        if auth != "x-punch-auth":
-            continue
-        if not key:
-            continue
-        if not _looks_like_real_key(key):
-            return True
-    return False
-
-
-def _looks_v2_stale_xpunch(backend: Backend) -> bool:
-    """True iff this backend looks like an install-dialog-garbage artifact:
-    URL is a canonical Kerberos host AND auth is x-punch-auth AND the key
-    fails the real-key shape check. A legitimate service-account install
-    at the same host with a real key (43-char token_urlsafe etc.) is NOT
-    matched — `_looks_like_real_key` is permissive on purpose.
-
-    The smoking gun is: post-Kerberos-cutover the v2 host expects
-    `auth=negotiate` by default; the only way an x-punch-auth backend
-    lands there with a garbage key is either:
-      (a) the user typed something into a "required" install-dialog
-          API-key field that was later realised to be optional, or
-      (b) a pre-cutover install seeded with a real key that has since
-          been NULL'd in pa_users.
-
-    (a) is the common case we want to recover from. (b) is rarer and
-    typically presents as a 43-char real-looking string — the shape
-    check passes and we DON'T archive, leaving the operator to rotate
-    via pa_admin or hand-edit. False-positive minimisation is more
-    important than false-negative coverage here.
-    """
-    try:
-        host = (urlparse(backend.url).hostname or "").lower()
-    except (ValueError, AttributeError):
-        return False
-    if host not in _KERBEROS_HOSTS:
-        return False
-    if (backend.auth or "").lower() != "x-punch-auth":
-        return False
-    if not backend.key:
-        return False
-    return not _looks_like_real_key(backend.key)
 
 
 def _archive_v1_backends_file(cfg_path: Path, reason: str) -> Path | None:
@@ -870,23 +786,14 @@ def _load_backends() -> tuple[list[Backend], Backend | None]:
                     _maybe_seed_backends_file(cfg_path)
                     backends, primary_name = _load_backends_from_file(cfg_path)
 
-            # v3.0.7: detect a stale install-dialog-garbage backends.json.
-            # Same archive + re-seed shape as v1-nuke. Check the RAW file
-            # rather than the loaded Backend list — _load_backends_from_file
-            # already strips placeholder-shaped keys at the v2.2.7 guard,
-            # so by the time we have Backend instances the smoking-gun key
-            # value has been zeroed.
-            if _file_has_v2_stale_xpunch(cfg_path):
-                _log_event(
-                    "backends_v2_stale_xpunch_detected",
-                    level=logging.WARNING,
-                    path=str(cfg_path),
-                    backend_count=len(backends),
-                )
-                archived = _archive_v1_backends_file(cfg_path, reason="v2_stale_xpunch")
-                if archived is not None:
-                    _maybe_seed_backends_file(cfg_path)
-                    backends, primary_name = _load_backends_from_file(cfg_path)
+            # v3.0.7 added a load-time auto-archive of stale-xpunch
+            # backends here; rolled back in v3.0.8. The heuristic couldn't
+            # catch wrong-host installs (e.g. zabbix-port 3002 stuck in
+            # x-punch-auth mode) without widening the host set to a point
+            # where false-positives became likely. Deterministic recovery
+            # via `operational/reset-punch.cmd` covers every broken-state
+            # shape uniformly; v3.0.5's v1-nuke above stays because it
+            # targets a specific defunct host, not a key-shape guess.
             if backends:
                 primary = next(
                     (b for b in backends if b.name == primary_name),
