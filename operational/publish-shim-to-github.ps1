@@ -37,7 +37,10 @@ param(
     [switch] $DryRun,
     [switch] $SkipBuild,
     [switch] $NoTag,
-    [string] $BaseRelease = '2.4.1'   # forwarded to build-mcpb.ps1
+    [switch] $NoGhRelease,            # skip the `gh release create` step
+    [string] $BaseRelease = '2.4.1',  # forwarded to build-mcpb.ps1
+    [string] $TagPrefix   = 'punch-analytics-v',
+    [string] $ReleaseTitle = ''       # if empty, generated from version
 )
 
 $ErrorActionPreference = 'Stop'
@@ -101,8 +104,9 @@ if ($found.Count -eq 0) {
 if ($DryRun) {
     Step "Dry-run: stopping before commit/tag/push"
     Note ("Would commit: {0}" -f ($found -join ', '))
-    Note "Would tag:    v$Version"
-    Note "Would push:   origin main + tag v$Version"
+    Note "Would tag:    $TagPrefix$Version"
+    Note "Would push:   origin main + tag $TagPrefix$Version"
+    if (-not $NoGhRelease) { Note "Would gh release create $TagPrefix$Version with releases/punch-analytics-$Version.mcpb attached" }
     exit 0
 }
 
@@ -114,12 +118,13 @@ $commitMsg = "shim v$Version — published via publish-shim-to-github.ps1"
 if ($LASTEXITCODE -ne 0) { Fail "git commit exited $LASTEXITCODE"; exit $LASTEXITCODE }
 Ok "Committed v$Version"
 
-# 5. Tag
+# 5. Tag (project convention: punch-analytics-vX.Y.Z)
+$tagName = "$TagPrefix$Version"
 if (-not $NoTag) {
-    Step "Tagging v$Version"
-    & git tag -a "v$Version" -m "shim v$Version"
+    Step "Tagging $tagName"
+    & git tag -a $tagName -m "shim $tagName"
     if ($LASTEXITCODE -ne 0) { Fail "git tag exited $LASTEXITCODE"; exit $LASTEXITCODE }
-    Ok "Tagged v$Version"
+    Ok "Tagged $tagName"
 }
 
 # 6. Push
@@ -127,10 +132,36 @@ Step "Pushing to origin"
 & git push origin main
 if ($LASTEXITCODE -ne 0) { Fail "git push main exited $LASTEXITCODE"; exit $LASTEXITCODE }
 if (-not $NoTag) {
-    & git push origin "v$Version"
+    & git push origin $tagName
     if ($LASTEXITCODE -ne 0) { Fail "git push tag exited $LASTEXITCODE"; exit $LASTEXITCODE }
 }
-Ok "Pushed v$Version to origin"
+Ok "Pushed $tagName to origin"
+
+# 7. Create GitHub Release (the user-facing "Releases" tab depends on this;
+# a tag alone is invisible there).
+if (-not $NoGhRelease -and -not $NoTag) {
+    Step "Creating GitHub Release $tagName"
+    if (-not $ReleaseTitle) {
+        $ReleaseTitle = "Punch Analytics MCPB v$Version"
+    }
+    $mcpbName = "punch-analytics-$Version.mcpb"
+    $mcpbPath = Join-Path $repoRoot ('releases/' + $mcpbName)
+    # gh-release notes: pull the last commit body so the release page links
+    # back to the change rationale without manual copy-paste.
+    $lastCommitBody = & git log -1 --format='%B'
+    $notesPath = [System.IO.Path]::GetTempFileName()
+    [System.IO.File]::WriteAllText($notesPath, $lastCommitBody, [System.Text.UTF8Encoding]::new($false))
+    try {
+        & gh release create $tagName $mcpbPath --title $ReleaseTitle --notes-file $notesPath
+        if ($LASTEXITCODE -ne 0) {
+            Fail "gh release create exited $LASTEXITCODE (the tag is pushed; you can run gh release create by hand later)"
+        } else {
+            Ok "Release $tagName published"
+        }
+    } finally {
+        Remove-Item $notesPath -ErrorAction SilentlyContinue
+    }
+}
 
 Write-Host ""
 Write-Host "Done. Auto-update laptops will pick up v$Version on next Claude Desktop bounce." -ForegroundColor Green
