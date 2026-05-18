@@ -146,7 +146,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "3.0.4"
+_SHIM_VERSION = "3.0.5"
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +584,67 @@ _DEFAULT_BACKENDS_TEMPLATE: dict = {
 }
 
 
+# v3.0.5 — v1 was retired at the v0.0.115/116 Kerberos cutover. Laptops
+# carrying a backends.json that still points at the v1 host will fail
+# on every call (URL unreachable or — if v1 is still up — pointing at
+# the wrong cluster entirely). Detect that shape on shim startup,
+# archive the stale file (so a user can recover if we're wrong),
+# and let the existing auto-seed write a fresh Kerberos-default
+# backends.json. Hostnames here are case-folded before comparison.
+_V1_HOSTS = frozenset({
+    "mcp.punchpowertrain.com",
+})
+
+
+def _looks_v1_backend(backend: Backend) -> bool:
+    """Return True if this backend's URL host is a known v1 host."""
+    try:
+        host = (urlparse(backend.url).hostname or "").lower()
+    except (ValueError, AttributeError):
+        return False
+    return host in _V1_HOSTS
+
+
+def _archive_v1_backends_file(cfg_path: Path, reason: str) -> Path | None:
+    """Rename cfg_path to a timestamped .v1-archived-<ts> sidecar.
+
+    Returns the archive path on success, None on failure. Failures
+    are non-fatal — caller logs and falls through to the env-var
+    fallback path. We rename rather than delete so a user / admin
+    can recover if the heuristic was wrong.
+    """
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    archive = cfg_path.with_name(cfg_path.name + f".v1-archived-{ts}")
+    try:
+        cfg_path.rename(archive)
+    except OSError as e:
+        _log_event(
+            "backends_v1_archive_failed",
+            level=logging.WARNING,
+            path=str(cfg_path),
+            archive=str(archive),
+            reason=reason,
+            error=f"{type(e).__name__}: {e}",
+        )
+        return None
+    _log_event(
+        "backends_v1_archived",
+        level=logging.WARNING,
+        path=str(cfg_path),
+        archive=str(archive),
+        reason=reason,
+        note=(
+            "Stale v1 backends.json detected on shim startup. File renamed "
+            "to the .v1-archived sidecar above so it can be recovered if "
+            "this was a false positive. The shim will now seed a fresh "
+            "Kerberos-default backends.json in its place. v1 was retired "
+            "at the v0.0.115/116 cutover; v2 (ai.punchpowertrain.com) is "
+            "the only valid target now."
+        ),
+    )
+    return archive
+
+
 def _maybe_seed_backends_file(cfg_path: Path) -> bool:
     """If cfg_path doesn't exist, write a default backends.json.
 
@@ -682,6 +743,25 @@ def _load_backends() -> tuple[list[Backend], Backend | None]:
     if cfg_path.exists():
         try:
             backends, primary_name = _load_backends_from_file(cfg_path)
+            # v3.0.5: detect a stale v1-era backends.json. v1 is gone
+            # post-Kerberos cutover; carrying an old config will fail
+            # every call. Archive + re-seed + reload.
+            if backends and any(_looks_v1_backend(b) for b in backends):
+                stale_hosts = sorted({
+                    urlparse(b.url).hostname or "?" for b in backends
+                    if _looks_v1_backend(b)
+                })
+                _log_event(
+                    "backends_v1_detected",
+                    level=logging.WARNING,
+                    path=str(cfg_path),
+                    v1_hosts=stale_hosts,
+                    backend_count=len(backends),
+                )
+                archived = _archive_v1_backends_file(cfg_path, reason="v1_host_in_url")
+                if archived is not None:
+                    _maybe_seed_backends_file(cfg_path)
+                    backends, primary_name = _load_backends_from_file(cfg_path)
             if backends:
                 primary = next(
                     (b for b in backends if b.name == primary_name),
