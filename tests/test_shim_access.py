@@ -160,3 +160,52 @@ def test_enrich_never_double_annotates():
     payload = {"error_type": "AccessDenied", "_shim_note": "pre-existing"}
     out = shim._enrich_response(payload, http_status=403)
     assert out["_shim_note"] == "pre-existing"
+
+
+def test_call_remote_enriches_zero_row_result(monkeypatch):
+    """_call_remote runs _enrich_response on a backend success response —
+    a 0-row TableHandleResult comes back carrying the _shim_note pointer."""
+    shim = _import_shim()
+    backend = shim._BACKENDS[0]
+
+    class _Resp:
+        status_code = 200
+        content = b"{}"
+        text = "{}"
+        def json(self):
+            return {"result": {"handle": "pa_x.q_1", "row_count": 0,
+                                "columns": []}}
+
+    class _Client:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def post(self, *a, **kw): return _Resp()
+
+    monkeypatch.setitem(shim._NAME_TO_BACKEND, "pa_demo", (backend, "pa_demo"))
+    monkeypatch.setattr(backend, "http_client", lambda **kw: _Client())
+    out = json.loads(shim._call_remote("pa_demo", {}))
+    assert "0 rows" in out["_shim_note"]
+
+
+def test_call_remote_enriches_403(monkeypatch):
+    """_call_remote runs _enrich_response on a 4xx — a 403 comes back
+    carrying the access-denial _shim_note."""
+    shim = _import_shim()
+    backend = shim._BACKENDS[0]
+
+    class _Resp:
+        status_code = 403
+        content = b"{}"
+        text = "{}"
+        def json(self):
+            return {"error_type": "AccessDenied", "message": "denied"}
+
+    class _Client:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def post(self, *a, **kw): return _Resp()
+
+    monkeypatch.setitem(shim._NAME_TO_BACKEND, "pa_demo", (backend, "pa_demo"))
+    monkeypatch.setattr(backend, "http_client", lambda **kw: _Client())
+    out = json.loads(shim._call_remote("pa_demo", {}))
+    assert "shim_access" in out["_shim_note"]

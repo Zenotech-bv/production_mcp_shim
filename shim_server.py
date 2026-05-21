@@ -146,7 +146,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "3.0.8"
+_SHIM_VERSION = "3.1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -1582,7 +1582,9 @@ def _call_remote(registered_name: str, kwargs: dict) -> str:
                    status=r.status_code,
                    elapsed_ms=elapsed_ms, response_bytes=response_bytes)
         try:
-            return json.dumps(r.json(), indent=2, default=str)
+            return json.dumps(
+                _enrich_response(r.json(), http_status=r.status_code),
+                indent=2, default=str)
         except Exception:
             return json.dumps({
                 "error": True,
@@ -1597,7 +1599,10 @@ def _call_remote(registered_name: str, kwargs: dict) -> str:
         envelope = r.json()
     except Exception:
         return r.text
-    return json.dumps(envelope.get("result", envelope), indent=2, default=str)
+    result = envelope.get("result", envelope)
+    return json.dumps(
+        _enrich_response(result, http_status=r.status_code),
+        indent=2, default=str)
 
 
 # ---------------------------------------------------------------------------
