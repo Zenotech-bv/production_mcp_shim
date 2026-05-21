@@ -1272,6 +1272,33 @@ def _fetch_tools_for_backend(backend: Backend) -> list[dict] | None:
     return tools
 
 
+def _probe_backend(backend: Backend) -> dict:
+    """Probe one backend's reachability and auth in a single GET /tools.
+
+    Returns {backend, url, reachable, auth_ok, status}. Never raises:
+      - ConnectError / timeout / transport error -> reachable=False
+      - HTTP 401                                  -> reachable=True, auth_ok=False
+      - any other HTTP status                     -> reachable=True, auth_ok=True
+    """
+    result: dict = {
+        "backend": backend.name, "url": backend.url,
+        "reachable": False, "auth_ok": False, "status": None,
+    }
+    if not backend.is_configured:
+        return result
+    try:
+        with backend.http_client(read_timeout=_TOOLS_FETCH_TIMEOUT_S) as c:
+            r = c.get("/tools", timeout=_TOOLS_FETCH_TIMEOUT_S)
+    except Exception as e:
+        _log_event("shim_access_probe_unreachable", level=logging.DEBUG,
+                   backend=backend.name, error=f"{type(e).__name__}: {e}")
+        return result
+    result["reachable"] = True
+    result["status"] = r.status_code
+    result["auth_ok"] = r.status_code != 401
+    return result
+
+
 def _load_bundled_sap_fallback() -> list[dict]:
     """If the SAP backend is unreachable AND a bundled tools.json
     exists, register the bundled tool set under the SAP backend's name.
