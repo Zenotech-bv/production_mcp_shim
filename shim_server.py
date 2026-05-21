@@ -1472,9 +1472,11 @@ def _enrich_response(payload: Any, *, http_status: int) -> Any:
     # Zero-row table-handle result — identified by the (str handle, int
     # row_count) pair that only a TableHandleResult carries. A scalar,
     # admin, or error response has no such pair and is left untouched.
+    # bool is an int subclass; exclude it so a stray `false` can't misfire.
+    row_count = payload.get("row_count")
     if (isinstance(payload.get("handle"), str)
-            and isinstance(payload.get("row_count"), int)
-            and payload["row_count"] == 0):
+            and isinstance(row_count, int) and not isinstance(row_count, bool)
+            and row_count == 0):
         payload["_shim_note"] = (
             "0 rows. If you expected data, run shim_access to check your "
             "account's company-code / project coverage."

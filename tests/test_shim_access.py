@@ -114,9 +114,17 @@ def test_shim_access_pa_whoami_error_envelope_becomes_account_error(monkeypatch)
     assert payload["account_error"] == "Cannot reach backend"
 
 
-def test_enrich_403_adds_note():
+def test_enrich_403_status_adds_note():
+    """The http_status==403 arm fires on its own — body has no error_type."""
     shim = _import_shim()
-    out = shim._enrich_response({"error_type": "AccessDenied"}, http_status=403)
+    out = shim._enrich_response({"message": "forbidden"}, http_status=403)
+    assert "shim_access" in out["_shim_note"]
+
+
+def test_enrich_access_denied_envelope_at_200_adds_note():
+    """The error_type=='AccessDenied' arm fires on its own at a non-403 status."""
+    shim = _import_shim()
+    out = shim._enrich_response({"error_type": "AccessDenied"}, http_status=200)
     assert "shim_access" in out["_shim_note"]
 
 
