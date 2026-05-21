@@ -1282,6 +1282,7 @@ def _probe_backend(backend: Backend) -> dict:
     """
     result: dict = {
         "backend": backend.name, "url": backend.url,
+        "configured": backend.is_configured,
         "reachable": False, "auth_ok": False, "status": None,
     }
     if not backend.is_configured:
