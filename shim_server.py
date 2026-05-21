@@ -1827,7 +1827,7 @@ mcp.tool()(shim_info)
 # ---------------------------------------------------------------------------
 
 def _build_access_summary(connectivity: list[dict], account, account_error) -> str:
-    """One human sentence: connectivity + the server-built account summary."""
+    """Human-readable connectivity + account summary (one or more sentences)."""
     ok = [c["backend"] for c in connectivity if c["reachable"] and c["auth_ok"]]
     bad = [c["backend"] for c in connectivity if not (c["reachable"] and c["auth_ok"])]
     parts: list[str] = []
@@ -1860,7 +1860,10 @@ async def shim_access(ctx: Context) -> str:
             except json.JSONDecodeError:
                 account_error = "pa_whoami returned a non-JSON response"
             else:
-                if isinstance(parsed, dict) and parsed.get("error"):
+                if not isinstance(parsed, dict):
+                    account_error = (f"pa_whoami returned an unexpected "
+                                     f"{type(parsed).__name__}, not an object")
+                elif parsed.get("error"):
                     account_error = str(parsed.get("message") or "pa_whoami failed")
                 else:
                     account = parsed

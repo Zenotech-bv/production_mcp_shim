@@ -73,7 +73,7 @@ def test_shim_access_pa_whoami_missing_degrades_gracefully():
     assert isinstance(payload["connectivity"], list)
     assert payload["account"] is None
     assert "pa_whoami" in payload["account_error"]
-    assert payload["summary"]
+    assert "Access profile unavailable" in payload["summary"]
 
 
 def test_shim_access_includes_account_when_pa_whoami_present(monkeypatch):
@@ -97,3 +97,18 @@ def test_shim_access_survives_internal_failure(monkeypatch):
     payload = _call_shim_access(shim)
     assert payload["shim_version"] == shim._SHIM_VERSION
     assert "error_type" in payload
+
+
+def test_shim_access_pa_whoami_error_envelope_becomes_account_error(monkeypatch):
+    """pa_whoami registered but returning an error envelope -> account_error,
+    account stays None. Covers the 'connected but the call failed' branch."""
+    shim = _import_shim()
+    monkeypatch.setitem(shim._NAME_TO_BACKEND, "pa_whoami",
+                        (shim._BACKENDS[0], "pa_whoami"))
+    monkeypatch.setattr(shim, "_call_remote",
+                        lambda name, kw: json.dumps(
+                            {"error": True, "error_type": "Unreachable",
+                             "message": "Cannot reach backend"}))
+    payload = _call_shim_access(shim)
+    assert payload["account"] is None
+    assert payload["account_error"] == "Cannot reach backend"
