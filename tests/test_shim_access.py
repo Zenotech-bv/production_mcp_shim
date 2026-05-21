@@ -112,3 +112,43 @@ def test_shim_access_pa_whoami_error_envelope_becomes_account_error(monkeypatch)
     payload = _call_shim_access(shim)
     assert payload["account"] is None
     assert payload["account_error"] == "Cannot reach backend"
+
+
+def test_enrich_403_adds_note():
+    shim = _import_shim()
+    out = shim._enrich_response({"error_type": "AccessDenied"}, http_status=403)
+    assert "shim_access" in out["_shim_note"]
+
+
+def test_enrich_zero_row_table_handle_adds_pointer():
+    shim = _import_shim()
+    payload = {"handle": "pa_x.q_123", "row_count": 0, "columns": []}
+    out = shim._enrich_response(payload, http_status=200)
+    assert "0 rows" in out["_shim_note"]
+
+
+def test_enrich_non_empty_table_handle_untouched():
+    shim = _import_shim()
+    payload = {"handle": "pa_x.q_123", "row_count": 42, "columns": []}
+    out = shim._enrich_response(payload, http_status=200)
+    assert "_shim_note" not in out
+
+
+def test_enrich_scalar_result_untouched():
+    """A non-row-shaped result (no handle/row_count pair) is never annotated."""
+    shim = _import_shim()
+    payload = {"schema": "pa_x", "figures": {}, "methodology": "..."}
+    out = shim._enrich_response(payload, http_status=200)
+    assert "_shim_note" not in out
+
+
+def test_enrich_non_dict_untouched():
+    shim = _import_shim()
+    assert shim._enrich_response([1, 2, 3], http_status=200) == [1, 2, 3]
+
+
+def test_enrich_never_double_annotates():
+    shim = _import_shim()
+    payload = {"error_type": "AccessDenied", "_shim_note": "pre-existing"}
+    out = shim._enrich_response(payload, http_status=403)
+    assert out["_shim_note"] == "pre-existing"

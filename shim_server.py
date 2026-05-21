@@ -1447,6 +1447,42 @@ def _reload_registry() -> tuple[
 
 
 # ---------------------------------------------------------------------------
+# _enrich_response — deterministic failure enrichment
+# ---------------------------------------------------------------------------
+
+
+def _enrich_response(payload: Any, *, http_status: int) -> Any:
+    """Add a deterministic `_shim_note` to a response that is an access
+    denial or a zero-row table-handle result. Every other shape is returned
+    untouched. No heuristics — the note never guesses a cause; on an empty
+    result it only points at shim_access.
+
+    `payload` is the already-parsed JSON body. `http_status` is the backend's
+    HTTP status code. Mutates and returns `payload` when it is a dict.
+    """
+    if not isinstance(payload, dict) or "_shim_note" in payload:
+        return payload
+    # Access denial — an explicit 403, or an error envelope naming it.
+    if http_status == 403 or payload.get("error_type") == "AccessDenied":
+        payload["_shim_note"] = (
+            "Your account may lack the access this tool needs. Call "
+            "shim_access to see your account's full access profile."
+        )
+        return payload
+    # Zero-row table-handle result — identified by the (str handle, int
+    # row_count) pair that only a TableHandleResult carries. A scalar,
+    # admin, or error response has no such pair and is left untouched.
+    if (isinstance(payload.get("handle"), str)
+            and isinstance(payload.get("row_count"), int)
+            and payload["row_count"] == 0):
+        payload["_shim_note"] = (
+            "0 rows. If you expected data, run shim_access to check your "
+            "account's company-code / project coverage."
+        )
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # _call_remote — looks up the backend and forwards
 # ---------------------------------------------------------------------------
 
