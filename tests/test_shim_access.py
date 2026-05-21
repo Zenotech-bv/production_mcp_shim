@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import importlib
+import json
+from unittest.mock import MagicMock
 
 
 def _import_shim():
@@ -55,3 +57,43 @@ def test_probe_backend_auth_failed(monkeypatch):
     result = shim._probe_backend(backend)
     assert result["reachable"] is True
     assert result["auth_ok"] is False
+
+
+def _call_shim_access(shim):
+    import asyncio
+    return json.loads(asyncio.run(shim.shim_access(MagicMock())))
+
+
+def test_shim_access_pa_whoami_missing_degrades_gracefully():
+    """With pa_whoami unregistered (old/unreachable pa_v2), account is null
+    and account_error explains why — shim_access still returns cleanly."""
+    shim = _import_shim()
+    payload = _call_shim_access(shim)
+    assert payload["shim_version"] == shim._SHIM_VERSION
+    assert isinstance(payload["connectivity"], list)
+    assert payload["account"] is None
+    assert "pa_whoami" in payload["account_error"]
+    assert payload["summary"]
+
+
+def test_shim_access_includes_account_when_pa_whoami_present(monkeypatch):
+    """When pa_whoami is reachable, its profile lands under 'account'."""
+    shim = _import_shim()
+    fake_profile = {"identity": {"username": "matt_stevens"},
+                    "systems": [], "summary": "SAP: full access."}
+    monkeypatch.setitem(shim._NAME_TO_BACKEND, "pa_whoami",
+                        (shim._BACKENDS[0], "pa_whoami"))
+    monkeypatch.setattr(shim, "_call_remote",
+                        lambda name, kw: json.dumps(fake_profile))
+    payload = _call_shim_access(shim)
+    assert payload["account"] == fake_profile
+    assert "SAP: full access." in payload["summary"]
+
+
+def test_shim_access_survives_internal_failure(monkeypatch):
+    """A blown-up internal state still yields JSON carrying the version."""
+    shim = _import_shim()
+    monkeypatch.setattr(shim, "_BACKENDS", None)  # iterating None raises
+    payload = _call_shim_access(shim)
+    assert payload["shim_version"] == shim._SHIM_VERSION
+    assert "error_type" in payload

@@ -1820,6 +1820,75 @@ mcp.tool()(shim_info)
 
 
 # ---------------------------------------------------------------------------
+# v3.1.0 — shim_access: report what the calling account can access. Combines
+# per-backend connectivity (the shim knows this) with the pa_whoami access
+# profile (the server knows this). Answers "what can I access?" and
+# disambiguates "connected but unauthorised" from "not connected".
+# ---------------------------------------------------------------------------
+
+def _build_access_summary(connectivity: list[dict], account, account_error) -> str:
+    """One human sentence: connectivity + the server-built account summary."""
+    ok = [c["backend"] for c in connectivity if c["reachable"] and c["auth_ok"]]
+    bad = [c["backend"] for c in connectivity if not (c["reachable"] and c["auth_ok"])]
+    parts: list[str] = []
+    if ok:
+        parts.append(f"Connected to {', '.join(ok)}.")
+    if bad:
+        parts.append(f"NOT connected to {', '.join(bad)}.")
+    if isinstance(account, dict) and account.get("summary"):
+        parts.append(str(account["summary"]))
+    elif account_error:
+        parts.append(f"Access profile unavailable: {account_error}")
+    return " ".join(parts).strip()
+
+
+async def shim_access(ctx: Context) -> str:
+    """Report what your account can access: per-backend connectivity plus your
+    access profile (systems, SAP company codes, Atlassian projects, Zabbix
+    scope) from the server's pa_whoami tool. Use this to answer 'what can I
+    access?' or to check whether a failure is 'not connected' vs 'connected
+    but your account is not authorised'."""
+    try:
+        connectivity = [_probe_backend(b) for b in _BACKENDS]
+
+        account = None
+        account_error: str | None = None
+        if "pa_whoami" in _NAME_TO_BACKEND:
+            raw = _call_remote("pa_whoami", {})
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                account_error = "pa_whoami returned a non-JSON response"
+            else:
+                if isinstance(parsed, dict) and parsed.get("error"):
+                    account_error = str(parsed.get("message") or "pa_whoami failed")
+                else:
+                    account = parsed
+        else:
+            account_error = ("pa_whoami is not registered — the pa_v2 server "
+                             "may predate this tool. Update pa_v2.")
+
+        return json.dumps({
+            "shim_version":  _SHIM_VERSION,
+            "connectivity":  connectivity,
+            "account":       account,
+            "account_error": account_error,
+            "summary":       _build_access_summary(connectivity, account, account_error),
+        }, indent=2, default=str)
+    except Exception as e:
+        _log_event("shim_access_failed", level=logging.ERROR,
+                   error=f"{type(e).__name__}: {e}")
+        return json.dumps({
+            "shim_version": _SHIM_VERSION,
+            "error_type":   type(e).__name__,
+            "message":      str(e),
+        }, indent=2)
+
+
+mcp.tool()(shim_access)
+
+
+# ---------------------------------------------------------------------------
 # Entry
 # ---------------------------------------------------------------------------
 
