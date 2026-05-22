@@ -44,6 +44,7 @@ def _isolate_shim_env(tmp_path_factory):
     os.environ["PUNCH_SAP_KEY"]                = ""    # don't pick up a real one
     os.environ["PUNCH_SHIM_AUTO_UPDATE"]       = "0"   # never self-update during tests
     os.environ["PUNCH_SHIM_RELOAD_INTERVAL_S"] = "0"   # disable throttle for tests
+    os.environ["PUNCH_SHIM_DISCOVERY_URL"]     = ""    # no discovery network call under test
     os.environ.setdefault("PUNCH_SAP_TOOLS_TIMEOUT", "1")  # fast soft-fail on /tools
 
     yield cfg

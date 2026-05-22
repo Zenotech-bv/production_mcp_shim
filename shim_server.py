@@ -1041,7 +1041,84 @@ def _bundled_server_version() -> str | None:
 # Resolve backends + primary at module load
 # ---------------------------------------------------------------------------
 
+# --- SHIM-1: backend discovery -------------------------------------------
+# At startup the shim asks the supervisor for the canonical backend list,
+# so a NEW backend needs no shim release. Discovery is additive-only (a
+# name already loaded locally always wins) and strictly best-effort (any
+# failure -> the shim runs on its local backends exactly as before). Set
+# PUNCH_SHIM_DISCOVERY_URL="" to disable it (the test suite does this so
+# importing the module makes no network call).
+_DISCOVERY_URL = os.environ.get(
+    "PUNCH_SHIM_DISCOVERY_URL",
+    "http://ai.punchpowertrain.com:3030/api/discover/backends",
+)
+_DISCOVERY_TIMEOUT_S = 3.0
+
+
+def _fetch_discovery() -> dict | None:
+    """GET the supervisor's discovery endpoint. Returns the parsed JSON
+    object, or None on any failure -- disabled (empty URL), unreachable,
+    timeout, non-200, or a non-JSON / non-object body. Never raises."""
+    if not _DISCOVERY_URL:
+        return None
+    try:
+        with httpx.Client(timeout=_DISCOVERY_TIMEOUT_S) as c:
+            r = c.get(_DISCOVERY_URL, headers={"Connection": "close"})
+        if r.status_code != 200:
+            _log_event("discovery_skipped", level=logging.INFO,
+                       reason=f"http_{r.status_code}", url=_DISCOVERY_URL)
+            return None
+        payload = r.json()
+        return payload if isinstance(payload, dict) else None
+    except Exception as e:
+        _log_event("discovery_skipped", level=logging.INFO,
+                   reason=f"{type(e).__name__}: {e}", url=_DISCOVERY_URL)
+        return None
+
+
+def _discover_backends(backends: list[Backend]) -> list[Backend]:
+    """Merge supervisor-discovered backends into `backends`, additive-only.
+
+    Appends any discovered backend whose name is not already present; a
+    name already loaded locally is never overridden. Best-effort: when
+    discovery is unavailable (`_fetch_discovery` -> None) or the payload
+    is malformed, `backends` is returned unchanged. Discovery never blocks
+    startup and never shrinks the backend set."""
+    payload = _fetch_discovery()
+    if payload is None:
+        return backends
+    discovered = payload.get("backends")
+    if not isinstance(discovered, list):
+        _log_event("discovery_skipped", level=logging.WARNING,
+                   reason="no_backends_array", url=_DISCOVERY_URL)
+        return backends
+
+    known = {b.name for b in backends}
+    result = list(backends)
+    added: list[str] = []
+    for entry in discovered:
+        if not isinstance(entry, dict):
+            continue
+        name = (entry.get("name") or "").strip()
+        url = (entry.get("url") or "").strip()
+        auth = (entry.get("auth") or "x-punch-auth").strip().lower()
+        if not name or not url:
+            _log_event("discovery_entry_skipped", level=logging.WARNING,
+                       reason="missing_name_or_url")
+            continue
+        if name in known:
+            continue                       # additive-only: local always wins
+        known.add(name)
+        result.append(Backend(name=name, url=url, header="X-Punch-Auth",
+                              key="", auth=auth))
+        added.append(name)
+    if added:
+        _log_event("discovery_merged", added=added, total_backends=len(result))
+    return result
+
+
 _BACKENDS, _PRIMARY = _load_backends()
+_BACKENDS = _discover_backends(_BACKENDS)
 
 
 # v2.3.1: prime the hot-reload mtime tracker so the FIRST throttle window
