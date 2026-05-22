@@ -146,7 +146,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "3.0.8"
+_SHIM_VERSION = "3.1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -1272,6 +1272,34 @@ def _fetch_tools_for_backend(backend: Backend) -> list[dict] | None:
     return tools
 
 
+def _probe_backend(backend: Backend) -> dict:
+    """Probe one backend's reachability and auth in a single GET /tools.
+
+    Returns {backend, url, reachable, auth_ok, status}. Never raises:
+      - ConnectError / timeout / transport error -> reachable=False
+      - HTTP 401                                  -> reachable=True, auth_ok=False
+      - any other HTTP status                     -> reachable=True, auth_ok=True
+    """
+    result: dict = {
+        "backend": backend.name, "url": backend.url,
+        "configured": backend.is_configured,
+        "reachable": False, "auth_ok": False, "status": None,
+    }
+    if not backend.is_configured:
+        return result
+    try:
+        with backend.http_client(read_timeout=_TOOLS_FETCH_TIMEOUT_S) as c:
+            r = c.get("/tools", timeout=_TOOLS_FETCH_TIMEOUT_S)
+    except Exception as e:
+        _log_event("shim_access_probe_unreachable", level=logging.DEBUG,
+                   backend=backend.name, error=f"{type(e).__name__}: {e}")
+        return result
+    result["reachable"] = True
+    result["status"] = r.status_code
+    result["auth_ok"] = r.status_code != 401
+    return result
+
+
 def _load_bundled_sap_fallback() -> list[dict]:
     """If the SAP backend is unreachable AND a bundled tools.json
     exists, register the bundled tool set under the SAP backend's name.
@@ -1419,6 +1447,44 @@ def _reload_registry() -> tuple[
 
 
 # ---------------------------------------------------------------------------
+# _enrich_response — deterministic failure enrichment
+# ---------------------------------------------------------------------------
+
+
+def _enrich_response(payload: Any, *, http_status: int) -> Any:
+    """Add a deterministic `_shim_note` to a response that is an access
+    denial or a zero-row table-handle result. Every other shape is returned
+    untouched. No heuristics — the note never guesses a cause; on an empty
+    result it only points at shim_access.
+
+    `payload` is the already-parsed JSON body. `http_status` is the backend's
+    HTTP status code. Mutates and returns `payload` when it is a dict.
+    """
+    if not isinstance(payload, dict) or "_shim_note" in payload:
+        return payload
+    # Access denial — an explicit 403, or an error envelope naming it.
+    if http_status == 403 or payload.get("error_type") == "AccessDenied":
+        payload["_shim_note"] = (
+            "Your account may lack the access this tool needs. Call "
+            "shim_access to see your account's full access profile."
+        )
+        return payload
+    # Zero-row table-handle result — identified by the (str handle, int
+    # row_count) pair that only a TableHandleResult carries. A scalar,
+    # admin, or error response has no such pair and is left untouched.
+    # bool is an int subclass; exclude it so a stray `false` can't misfire.
+    row_count = payload.get("row_count")
+    if (isinstance(payload.get("handle"), str)
+            and isinstance(row_count, int) and not isinstance(row_count, bool)
+            and row_count == 0):
+        payload["_shim_note"] = (
+            "0 rows. If you expected data, run shim_access to check your "
+            "account's company-code / project coverage."
+        )
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # _call_remote — looks up the backend and forwards
 # ---------------------------------------------------------------------------
 
@@ -1516,7 +1582,9 @@ def _call_remote(registered_name: str, kwargs: dict) -> str:
                    status=r.status_code,
                    elapsed_ms=elapsed_ms, response_bytes=response_bytes)
         try:
-            return json.dumps(r.json(), indent=2, default=str)
+            return json.dumps(
+                _enrich_response(r.json(), http_status=r.status_code),
+                indent=2, default=str)
         except Exception:
             return json.dumps({
                 "error": True,
@@ -1531,7 +1599,10 @@ def _call_remote(registered_name: str, kwargs: dict) -> str:
         envelope = r.json()
     except Exception:
         return r.text
-    return json.dumps(envelope.get("result", envelope), indent=2, default=str)
+    result = envelope.get("result", envelope)
+    return json.dumps(
+        _enrich_response(result, http_status=r.status_code),
+        indent=2, default=str)
 
 
 # ---------------------------------------------------------------------------
@@ -1789,6 +1860,78 @@ async def shim_info(ctx: Context) -> str:
 
 
 mcp.tool()(shim_info)
+
+
+# ---------------------------------------------------------------------------
+# v3.1.0 — shim_access: report what the calling account can access. Combines
+# per-backend connectivity (the shim knows this) with the pa_whoami access
+# profile (the server knows this). Answers "what can I access?" and
+# disambiguates "connected but unauthorised" from "not connected".
+# ---------------------------------------------------------------------------
+
+def _build_access_summary(connectivity: list[dict], account, account_error) -> str:
+    """Human-readable connectivity + account summary (one or more sentences)."""
+    ok = [c["backend"] for c in connectivity if c["reachable"] and c["auth_ok"]]
+    bad = [c["backend"] for c in connectivity if not (c["reachable"] and c["auth_ok"])]
+    parts: list[str] = []
+    if ok:
+        parts.append(f"Connected to {', '.join(ok)}.")
+    if bad:
+        parts.append(f"NOT connected to {', '.join(bad)}.")
+    if isinstance(account, dict) and account.get("summary"):
+        parts.append(str(account["summary"]))
+    elif account_error:
+        parts.append(f"Access profile unavailable: {account_error}")
+    return " ".join(parts).strip()
+
+
+async def shim_access(ctx: Context) -> str:
+    """Report what your account can access: per-backend connectivity plus your
+    access profile (systems, SAP company codes, Atlassian projects, Zabbix
+    scope) from the server's pa_whoami tool. Use this to answer 'what can I
+    access?' or to check whether a failure is 'not connected' vs 'connected
+    but your account is not authorised'."""
+    try:
+        connectivity = [_probe_backend(b) for b in _BACKENDS]
+
+        account = None
+        account_error: str | None = None
+        if "pa_whoami" in _NAME_TO_BACKEND:
+            raw = _call_remote("pa_whoami", {})
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                account_error = "pa_whoami returned a non-JSON response"
+            else:
+                if not isinstance(parsed, dict):
+                    account_error = (f"pa_whoami returned an unexpected "
+                                     f"{type(parsed).__name__}, not an object")
+                elif parsed.get("error"):
+                    account_error = str(parsed.get("message") or "pa_whoami failed")
+                else:
+                    account = parsed
+        else:
+            account_error = ("pa_whoami is not registered — the pa_v2 server "
+                             "may predate this tool. Update pa_v2.")
+
+        return json.dumps({
+            "shim_version":  _SHIM_VERSION,
+            "connectivity":  connectivity,
+            "account":       account,
+            "account_error": account_error,
+            "summary":       _build_access_summary(connectivity, account, account_error),
+        }, indent=2, default=str)
+    except Exception as e:
+        _log_event("shim_access_failed", level=logging.ERROR,
+                   error=f"{type(e).__name__}: {e}")
+        return json.dumps({
+            "shim_version": _SHIM_VERSION,
+            "error_type":   type(e).__name__,
+            "message":      str(e),
+        }, indent=2)
+
+
+mcp.tool()(shim_access)
 
 
 # ---------------------------------------------------------------------------
