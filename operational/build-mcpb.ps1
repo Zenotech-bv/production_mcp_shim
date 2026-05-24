@@ -76,10 +76,42 @@ Copy-Item -LiteralPath $canonical -Destination (Join-Path $staging 'server\shim_
 Ok "shim_server.py updated"
 
 Step "Sync deps from pyproject.toml into requirements.txt"
-$pyproj = Get-Content -Raw (Join-Path $staging 'pyproject.toml')
+$pyprojPath = Join-Path $staging 'pyproject.toml'
+$pyproj = Get-Content -Raw $pyprojPath
 $depMatch = [regex]::Match($pyproj, '(?ms)dependencies\s*=\s*\[(.*?)\]')
 if ($depMatch.Success) {
     $deps = [regex]::Matches($depMatch.Groups[1].Value, '"([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
+
+    # v3.2.1 — bake pywin32 into every Windows install. The Python mcp SDK's
+    # client/stdio submodule imports pywintypes (from pywin32) on Windows;
+    # without it the shim crashes on `from mcp.server.fastmcp import FastMCP`
+    # before any tool is registered, taking down every backend the shim
+    # federates. Surfaced 2026-05-23 when a laptop with a fresh venv hit
+    # `ModuleNotFoundError: No module named 'pywintypes'` in Claude Desktop's
+    # mcp-server log. Marker-controlled to remain idempotent if a baseline
+    # already declares it.
+    $pywin32Spec = 'pywin32 ; sys_platform == "win32"'
+    if (-not ($deps | Where-Object { $_ -match '^pywin32(\s|;|$)' })) {
+        $deps += $pywin32Spec
+        Note "injected dep: $pywin32Spec"
+        # Patch the staged pyproject.toml too, so `uv run` sees it at install time.
+        # Insert before the closing ]; preserve existing whitespace style.
+        # TOML quoting: an entry containing a double-quote must use literal
+        # single-quoted strings so the inner "win32" survives.
+        $newDepsBlock = ($deps | ForEach-Object {
+            if ($_ -like '*"*') { "    '$_'" } else { "    `"$_`"" }
+        }) -join ",`n"
+        $pyproj = [regex]::Replace(
+            $pyproj,
+            '(?ms)(dependencies\s*=\s*\[)(.*?)(\])',
+            "`$1`n$newDepsBlock,`n`$3"
+        )
+        [System.IO.File]::WriteAllText($pyprojPath, $pyproj, [System.Text.UTF8Encoding]::new($false))
+        Ok "pyproject.toml deps array patched to include pywin32"
+    } else {
+        Note "pywin32 already in baseline pyproject.toml; no patch needed"
+    }
+
     $reqLines = @(
         '# Laptop-side requirements -- auto-derived from pyproject.toml::[project].dependencies by build-mcpb.ps1.'
         ''
