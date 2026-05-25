@@ -1720,7 +1720,24 @@ def _register_one(registered_name: str, tool: dict, backend: Backend) -> None:
 
     params = []
     for arg_name, arg_schema in props.items():
-        t = arg_schema.get("type", "string")
+        # Pydantic emits `X | None` types as {"anyOf": [{"type": <X>}, {"type":
+        # "null"}]} with NO top-level "type" key. The original `.get("type",
+        # "string")` fallback silently registered every optional structured
+        # argument as a string, which made FastMCP serialise dicts/lists to
+        # JSON strings; the server's pydantic validator then rejected them
+        # with "Input should be a valid dictionary"/"valid list". This bit
+        # `pa_table_filter.where`, `pa_table_aggregate.having`, and
+        # `pa_table_aggregate.order_by` — caught in the 2026-05-25 PPS
+        # top-50 session findings (Zenotech-bv/punch-analytics
+        # docs/test-session-findings-2026-05-25-pps-top50.md).
+        t = arg_schema.get("type")
+        if t is None:
+            for variant in arg_schema.get("anyOf", []):
+                if variant.get("type") != "null":
+                    t = variant.get("type")
+                    break
+        if t is None:
+            t = "string"
         py_type = JSON_SCHEMA_TYPE_TO_PY.get(t, "str")
         default = arg_schema.get("default", None)
         default_repr = "None" if default is None else repr(default)
