@@ -146,7 +146,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "3.2.3"
+_SHIM_VERSION = "3.2.4"
 
 
 # ---------------------------------------------------------------------------
@@ -1731,6 +1731,16 @@ def _register_one(registered_name: str, tool: dict, backend: Backend) -> None:
         # top-50 session findings (Zenotech-bv/punch-analytics
         # docs/test-session-findings-2026-05-25-pps-top50.md).
         t = arg_schema.get("type")
+        # v3.2.4 — JSON Schema array-form nullable type: ["string", "null"].
+        # Some MCP backends emit this form (the rd MCP server's svn_log /
+        # svn_log_for_file tools, as of 2026-05-27) instead of the anyOf
+        # form pa_v2's pydantic produces. Normalise to a single non-null
+        # type before the dict lookup; without this,
+        # JSON_SCHEMA_TYPE_TO_PY.get(t) raised TypeError: unhashable type:
+        # 'list' and the registration crashed, taking the whole shim with
+        # it on every restart.
+        if isinstance(t, list):
+            t = next((x for x in t if x != "null"), None)
         if t is None:
             for variant in arg_schema.get("anyOf", []):
                 if variant.get("type") != "null":
