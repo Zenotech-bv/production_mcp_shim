@@ -146,7 +146,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "3.2.2"
+_SHIM_VERSION = "3.2.3"
 
 
 # ---------------------------------------------------------------------------
@@ -1779,8 +1779,38 @@ def _register_one(registered_name: str, tool: dict, backend: Backend) -> None:
         mcp.tool()(typed_fn)
 
 
+# v3.2.3 — defensive: per-tool try/except so one malformed upstream schema
+# can't take down the whole shim during startup. A failed registration
+# names itself in shim.log with the exception type + message; the rest of
+# the catalogue still registers, so chat stays usable while the offending
+# schema is fixed at the source.
+_REGISTRATION_FAILURES: list[dict] = []
 for _registered_name, _tool, _backend in _REGISTRATIONS:
-    _register_one(_registered_name, _tool, _backend)
+    try:
+        _register_one(_registered_name, _tool, _backend)
+    except Exception as _e:
+        _REGISTRATION_FAILURES.append({
+            "tool": _registered_name,
+            "backend": _backend.name,
+            "error_type": type(_e).__name__,
+            "error": str(_e),
+        })
+        _log_event(
+            "register_one_failed",
+            level=logging.ERROR,
+            tool=_registered_name,
+            backend=_backend.name,
+            error_type=type(_e).__name__,
+            error=str(_e),
+        )
+
+if _REGISTRATION_FAILURES:
+    _log_event(
+        "registration_failures_summary",
+        level=logging.WARNING,
+        failure_count=len(_REGISTRATION_FAILURES),
+        failures=_REGISTRATION_FAILURES,
+    )
 
 
 # ---------------------------------------------------------------------------
