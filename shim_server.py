@@ -146,7 +146,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "3.2.4"
+_SHIM_VERSION = "3.3.0"
 
 
 # ---------------------------------------------------------------------------
@@ -1524,6 +1524,154 @@ def _reload_registry() -> tuple[
 
 
 # ---------------------------------------------------------------------------
+# v3.3.0 — tool-catalogue auto-refresh
+#
+# The credential hot-reload (_maybe_reload_backends) deliberately re-applies
+# only key/url/header on an existing backend, NOT the tool registry — so a
+# backend that GAINS or DROPS tools (a pa_v2 deploy) used to strand the client
+# on a stale catalogue until a manual `shim_reload` (and even a Claude Desktop
+# *window* restart didn't help, since the shim subprocess kept its cached
+# fetch). This watcher closes that gap: it cheaply probes each backend's
+# /health (version + tool count) on its own throttle and, on a delta, runs the
+# SAME re-fetch+rebuild that shim_reload does. A deploy then self-heals on the
+# next tool call — the rebuilt registry is what the next tools/list (a new
+# chat / reconnect) returns. It also recovers a shim that soft-failed its
+# startup /tools fetch (backend briefly down): the next probe re-fetches.
+#
+# Notification caveat: the rebuild is synchronous (the FastMCP forwarders are
+# sync, ctx-less), so it does NOT push tools/list_changed to the *current*
+# conversation — a new chat picks up the fresh catalogue automatically. Manual
+# `shim_reload` remains for an instant in-conversation refresh.
+# ---------------------------------------------------------------------------
+
+_CATALOGUE_PROBE_THROTTLE_S = float(os.getenv("PUNCH_SHIM_CATALOGUE_PROBE_S", "30"))
+_LAST_CATALOGUE_PROBE_MONO  = 0.0
+# backend name -> last-seen (version, tool_count) from /health. Seeded at
+# startup (below). A delta, or a None baseline (startup probe failed because
+# the backend was briefly down), triggers a re-fetch+rebuild.
+_CATALOGUE_STAMPS: dict[str, tuple] = {}
+
+
+def _probe_catalogue_stamp(backend: "Backend") -> tuple | None:
+    """Cheap GET /health -> (version, tool_count), or None if the backend has
+    no /health, is unconfigured/unreachable, errors, or returns an unexpected
+    shape. None means "no usable signal": it never triggers a refresh and never
+    disturbs the working catalogue."""
+    if not backend.is_configured:
+        return None
+    try:
+        with backend.http_client(read_timeout=_TOOLS_FETCH_TIMEOUT_S) as c:
+            r = c.get("/health", timeout=_TOOLS_FETCH_TIMEOUT_S)
+        if not getattr(r, "is_success", False):
+            return None
+        data = r.json()
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    ver, tools = data.get("version"), data.get("tools")
+    if ver is None and tools is None:
+        return None
+    return (ver, tools)
+
+
+def _apply_catalogue_reload() -> dict:
+    """Re-fetch every backend's /tools and update FastMCP registrations in
+    place. SYNC — does NOT notify the client. Returns a summary with
+    added/removed/changed (sorted), total, fetch_failures, register_failures,
+    and `moved` (the catalogue changed). Shared by shim_reload (which adds the
+    client notification) and the auto-refresh watcher (which does not)."""
+    global _NAME_TO_BACKEND, _REGISTRATIONS
+    old_tool_by_name = {name: tool for name, tool, _b in _REGISTRATIONS}
+
+    new_name_to_backend, new_registrations, fetch_failures = _reload_registry()
+    new_tool_by_name    = {name: tool for name, tool, _b in new_registrations}
+    new_backend_by_name = {name: b for name, _t, b in new_registrations}
+
+    added   = [n for n in new_tool_by_name if n not in old_tool_by_name]
+    removed = [n for n in old_tool_by_name if n not in new_tool_by_name]
+    changed = [n for n in new_tool_by_name
+               if n in old_tool_by_name and new_tool_by_name[n] != old_tool_by_name[n]]
+
+    register_failures: list[str] = []
+    for name in removed + changed:
+        try:
+            mcp.remove_tool(name)
+        except Exception as e:
+            _log_event("shim_reload_remove_failed", level=logging.WARNING,
+                       tool=name, error=f"{type(e).__name__}: {e}")
+    for name in added + changed:
+        try:
+            _register_one(name, new_tool_by_name[name], new_backend_by_name[name])
+        except Exception as e:
+            register_failures.append(name)
+            _log_event("shim_reload_register_failed", level=logging.WARNING,
+                       tool=name, error=f"{type(e).__name__}: {e}")
+
+    _NAME_TO_BACKEND = new_name_to_backend
+    _REGISTRATIONS   = new_registrations
+
+    return {
+        "added": sorted(added),
+        "removed": sorted(removed),
+        "changed": sorted(changed),
+        "total": len(new_registrations),
+        "fetch_failures": fetch_failures,
+        "register_failures": register_failures,
+        "moved": bool(added or removed or changed),
+    }
+
+
+def _maybe_refresh_catalogue() -> dict | None:
+    """Throttled tool-catalogue auto-refresh. Probes each backend's /health;
+    on a (version, tool_count) delta — or an unknown baseline (startup probe
+    failed) — re-fetches + rebuilds the registry via _apply_catalogue_reload.
+    Returns the reload summary if a refresh ran, else None. Safe on every tool
+    call: throttled, and any probe failure is skipped so the working catalogue
+    is never disturbed."""
+    global _LAST_CATALOGUE_PROBE_MONO
+
+    now = time.monotonic()
+    if now - _LAST_CATALOGUE_PROBE_MONO < _CATALOGUE_PROBE_THROTTLE_S:
+        return None
+    _LAST_CATALOGUE_PROBE_MONO = now
+
+    needs_reload = False
+    for backend in _BACKENDS:
+        stamp = _probe_catalogue_stamp(backend)
+        if stamp is None:
+            continue  # no /health or unreachable -> leave catalogue as-is
+        prev = _CATALOGUE_STAMPS.get(backend.name)
+        if prev != stamp:
+            if prev is not None:
+                _log_event("catalogue_change_detected", backend=backend.name,
+                           old=list(prev), new=list(stamp))
+            _CATALOGUE_STAMPS[backend.name] = stamp
+            needs_reload = True
+
+    if not needs_reload:
+        return None
+
+    with _BACKENDS_RELOAD_LOCK:
+        result = _apply_catalogue_reload()
+    _log_event("catalogue_auto_refreshed",
+               added=result["added"], removed=result["removed"],
+               changed=result["changed"], total=result["total"],
+               fetch_failures=result["fetch_failures"],
+               register_failures=result["register_failures"])
+    return result
+
+
+# Seed the catalogue stamps so the watcher has a baseline matching what we just
+# registered at import. Best-effort: a backend unreachable now leaves its stamp
+# unset, and the first successful runtime probe reconciles (re-fetches) then.
+for _b in _BACKENDS:
+    _seed = _probe_catalogue_stamp(_b)
+    if _seed is not None:
+        _CATALOGUE_STAMPS[_b.name] = _seed
+
+
+# ---------------------------------------------------------------------------
 # _enrich_response — deterministic failure enrichment
 # ---------------------------------------------------------------------------
 
@@ -1573,6 +1721,10 @@ def _call_remote(registered_name: str, kwargs: dict) -> str:
     # rotated the user's key on the server, the next request after
     # the file lands picks up the new key — no Claude Desktop restart.
     _maybe_reload_backends()
+    # v3.3.0: throttled /health probe — if a backend's tool set changed (a
+    # deploy), re-fetch + rebuild so the fresh catalogue is live for the next
+    # tools/list, no manual shim_reload needed.
+    _maybe_refresh_catalogue()
     entry = _NAME_TO_BACKEND.get(registered_name)
     if entry is None:
         _log_event("tool_call_unknown", level=logging.ERROR,
@@ -1836,67 +1988,30 @@ async def shim_reload(ctx: Context) -> str:
     """Re-fetch the tool catalogue from every Punch backend and update this
     shim's registered tools in place — no Claude Desktop restart needed. Call
     this after a backend gains, drops, or changes a tool."""
-    global _NAME_TO_BACKEND, _REGISTRATIONS
     try:
-        old_tool_by_name = {name: tool for name, tool, _b in _REGISTRATIONS}
-
-        new_name_to_backend, new_registrations, fetch_failures = _reload_registry()
-        new_tool_by_name    = {name: tool for name, tool, _b in new_registrations}
-        new_backend_by_name = {name: b for name, _t, b in new_registrations}
-
-        added   = [n for n in new_tool_by_name if n not in old_tool_by_name]
-        removed = [n for n in old_tool_by_name if n not in new_tool_by_name]
-        changed = [n for n in new_tool_by_name
-                   if n in old_tool_by_name and new_tool_by_name[n] != old_tool_by_name[n]]
-
-        register_failures: list[str] = []
-
-        # Drop tools that are gone or whose schema changed (changed ones are
-        # re-added below). Defensive try/except — a stuck removal must not
-        # abort the whole reload.
-        for name in removed + changed:
-            try:
-                mcp.remove_tool(name)
-            except Exception as e:
-                _log_event("shim_reload_remove_failed", level=logging.WARNING,
-                           tool=name, error=f"{type(e).__name__}: {e}")
-
-        # (Re-)register new and changed tools. Per-tool try/except so one bad
-        # schema can't take the rest of the reload down.
-        for name in added + changed:
-            try:
-                _register_one(name, new_tool_by_name[name], new_backend_by_name[name])
-            except Exception as e:
-                register_failures.append(name)
-                _log_event("shim_reload_register_failed", level=logging.WARNING,
-                           tool=name, error=f"{type(e).__name__}: {e}")
-
-        _NAME_TO_BACKEND = new_name_to_backend
-        _REGISTRATIONS   = new_registrations
-
-        catalogue_moved = bool(added or removed or changed)
-        if catalogue_moved:
+        r = _apply_catalogue_reload()
+        if r["moved"]:
             await ctx.session.send_tool_list_changed()
 
         _log_event("shim_reload_done",
-                   added=sorted(added), removed=sorted(removed),
-                   changed=sorted(changed), total=len(new_registrations),
-                   fetch_failures=fetch_failures,
-                   register_failures=register_failures)
+                   added=r["added"], removed=r["removed"],
+                   changed=r["changed"], total=r["total"],
+                   fetch_failures=r["fetch_failures"],
+                   register_failures=r["register_failures"])
 
-        if catalogue_moved:
+        if r["moved"]:
             note = ("Claude Desktop has been notified (tools/list_changed); the "
                     "updated tool list is live in this conversation.")
         else:
             note = "No changes — every backend's catalogue is already current."
         return json.dumps({
             "reloaded": True,
-            "added": sorted(added),
-            "removed": sorted(removed),
-            "changed": sorted(changed),
-            "total_registered": len(new_registrations),
-            "fetch_failures": fetch_failures,
-            "register_failures": register_failures,
+            "added": r["added"],
+            "removed": r["removed"],
+            "changed": r["changed"],
+            "total_registered": r["total"],
+            "fetch_failures": r["fetch_failures"],
+            "register_failures": r["register_failures"],
             "note": note,
         }, indent=2)
     except Exception as e:
