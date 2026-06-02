@@ -146,7 +146,11 @@ from mcp.server.fastmcp import Context, FastMCP
 # to vend an update.
 # ---------------------------------------------------------------------------
 
-_SHIM_VERSION = "3.3.0"
+# v3.4.0 — call-time backend attribution: every dict response (and the
+# known-backend transport-error envelopes) is stamped `_shim_served_by`
+# so the client reports which federated backend served a call instead of
+# guessing. Strictly additive; see _enrich_response.
+_SHIM_VERSION = "3.4.0"
 
 
 # ---------------------------------------------------------------------------
@@ -1676,16 +1680,26 @@ for _b in _BACKENDS:
 # ---------------------------------------------------------------------------
 
 
-def _enrich_response(payload: Any, *, http_status: int) -> Any:
+def _enrich_response(payload: Any, *, http_status: int,
+                     backend: "Backend | None" = None) -> Any:
     """Add a deterministic `_shim_note` to a response that is an access
-    denial or a zero-row table-handle result. Every other shape is returned
-    untouched. No heuristics — the note never guesses a cause; on an empty
-    result it only points at shim_access.
+    denial or a zero-row table-handle result, and stamp `_shim_served_by`
+    so the client can tell which federated backend produced this result.
+    Both keys are namespaced `_shim_*` and strictly additive; every other
+    shape is returned untouched. No heuristics — the note never guesses a
+    cause; on an empty result it only points at shim_access.
 
     `payload` is the already-parsed JSON body. `http_status` is the backend's
-    HTTP status code. Mutates and returns `payload` when it is a dict.
+    HTTP status code. `backend` is the serving backend (when known).
+    Mutates and returns `payload` when it is a dict.
     """
-    if not isinstance(payload, dict) or "_shim_note" in payload:
+    if not isinstance(payload, dict):
+        return payload
+    # v3.4.0: additive, idempotent call-time attribution. setdefault so a
+    # backend that ever returns its own `_shim_served_by` wins.
+    if backend is not None:
+        payload.setdefault("_shim_served_by", backend.name)  # "rd" / "sap"
+    if "_shim_note" in payload:
         return payload
     # Access denial — an explicit 403, or an error envelope naming it.
     if http_status == 403 or payload.get("error_type") == "AccessDenied":
@@ -1752,6 +1766,7 @@ def _call_remote(registered_name: str, kwargs: dict) -> str:
                 f"Edit your backends.json or set PUNCH_SAP_KEY for the "
                 f"single-backend fallback."
             ),
+            "_shim_served_by": backend.name,
         }, indent=2)
 
     t0 = time.monotonic()
@@ -1774,6 +1789,7 @@ def _call_remote(registered_name: str, kwargs: dict) -> str:
             "error": True,
             "error_type": "Unreachable",
             "message": f"Cannot reach backend {backend.name!r} at {backend.url} - on VPN? {e}",
+            "_shim_served_by": backend.name,
         }, indent=2)
     except httpx.TimeoutException as e:
         elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
@@ -1788,6 +1804,7 @@ def _call_remote(registered_name: str, kwargs: dict) -> str:
                 f"No response from backend {backend.name!r} "
                 f"({backend.url}) in {PUNCH_SAP_TIMEOUT}s"
             ),
+            "_shim_served_by": backend.name,
         }, indent=2)
     except Exception as e:
         elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
@@ -1799,6 +1816,7 @@ def _call_remote(registered_name: str, kwargs: dict) -> str:
             "error": True,
             "error_type": "TransportError",
             "message": str(e),
+            "_shim_served_by": backend.name,
         }, indent=2)
 
     elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
@@ -1812,7 +1830,8 @@ def _call_remote(registered_name: str, kwargs: dict) -> str:
                    elapsed_ms=elapsed_ms, response_bytes=response_bytes)
         try:
             return json.dumps(
-                _enrich_response(r.json(), http_status=r.status_code),
+                _enrich_response(r.json(), http_status=r.status_code,
+                                 backend=backend),
                 indent=2, default=str)
         except Exception:
             return json.dumps({
@@ -1830,7 +1849,7 @@ def _call_remote(registered_name: str, kwargs: dict) -> str:
         return r.text
     result = envelope.get("result", envelope)
     return json.dumps(
-        _enrich_response(result, http_status=r.status_code),
+        _enrich_response(result, http_status=r.status_code, backend=backend),
         indent=2, default=str)
 
 
