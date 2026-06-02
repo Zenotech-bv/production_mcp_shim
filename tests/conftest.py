@@ -46,6 +46,10 @@ def _isolate_shim_env(tmp_path_factory):
     os.environ["PUNCH_SHIM_RELOAD_INTERVAL_S"] = "0"   # disable throttle for tests
     os.environ["PUNCH_SHIM_DISCOVERY_URL"]     = ""    # no discovery network call under test
     os.environ.setdefault("PUNCH_SAP_TOOLS_TIMEOUT", "1")  # fast soft-fail on /tools
+    # Isolate the log off the operator's real %LOCALAPPDATA%\PunchAnalytics\shim.log
+    # (_resolve_log_dir keys off LOCALAPPDATA) so importing/exercising shim_server
+    # in tests never writes to the live shim log.
+    os.environ["LOCALAPPDATA"] = str(tmp_dir)
 
     yield cfg
 
