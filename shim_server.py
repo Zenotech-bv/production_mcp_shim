@@ -161,7 +161,16 @@ from mcp.server.fastmcp import Context, FastMCP
 # showed the v2.4.1 blurb + 92 V1 tool names. build-mcpb.ps1 now reads the
 # description from manifest-{description,long-description}.txt and syncs the
 # tools array from the bundled tools.json. No shim logic change.
-_SHIM_VERSION = "3.4.2"
+# v3.4.3 — slow-connect-on-update fix. Each update extracts the .mcpb to a NEW
+# dir, so `uv run` rebuilt the Python env from scratch (download CPython +
+# ~33 wheels incl. pywin32 9MB) before the shim could start — minutes on a
+# corporate network, because the MS Store sandbox doesn't persist uv's default
+# cache. Fix: pin UV_PROJECT_ENVIRONMENT / UV_CACHE_DIR / UV_PYTHON_INSTALL_DIR
+# to ${HOME}/.punch-shim/* in the manifest env so the venv + cache + interpreter
+# PERSIST across updates (update -> reuse, not rebuild), and ship a uv.lock so
+# `uv run` skips re-resolution. First install still pays once; updates after are
+# seconds. No shim logic change.
+_SHIM_VERSION = "3.4.3"
 
 
 # ---------------------------------------------------------------------------

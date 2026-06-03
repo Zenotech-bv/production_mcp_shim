@@ -93,6 +93,19 @@ if (Test-Path $repoTools) {
     Note "no repo tools.json at $repoTools - bundled fallback left as baseline (stale)"
 }
 
+Step "Bundle uv.lock (v3.4.3 - fast, deterministic env build)"
+# Ship a uv.lock at the project root (next to pyproject.toml) so `uv run` skips
+# re-resolution on first env build. Combined with the persistent UV_* env vars
+# (added to the manifest below), the per-update env rebuild becomes a reuse.
+# Regenerate before a release via:  bin\uv.exe lock  (in a dir with pyproject.toml)
+$repoLock = Join-Path $repoRoot 'uv.lock'
+if (Test-Path $repoLock) {
+    Copy-Item -LiteralPath $repoLock -Destination (Join-Path $staging 'uv.lock') -Force
+    Ok "uv.lock bundled at project root"
+} else {
+    Note "no repo uv.lock at $repoLock - shipping without a lock (uv will resolve at launch)"
+}
+
 Step "Sync deps from pyproject.toml into requirements.txt"
 $pyprojPath = Join-Path $staging 'pyproject.toml'
 $pyproj = Get-Content -Raw $pyprojPath
@@ -217,6 +230,28 @@ if (Test-Path $repoToolsJson) {
 if ($man.compatibility -and $man.compatibility.runtimes -and $man.compatibility.runtimes.python) {
     $man.compatibility.runtimes.PSObject.Properties.Remove('python')
     Note "compatibility.runtimes.python removed (bundled via uv.exe)"
+}
+
+# v3.4.3 - persistent uv paths so the env survives .mcpb updates. Each update
+# extracts to a NEW dir; without these, `uv run` rebuilt the venv from scratch
+# every time (download CPython + ~33 wheels) - minutes on a corporate network,
+# because the MS Store Claude sandbox does not persist uv's default cache.
+# HOME/.punch-shim/* is a stable, non-virtualised location, so the venv + cache
+# + interpreter are REUSED on update (validated: 7s first build, 1s next update).
+# Single-quoted so the literal ${HOME} is written for Claude Desktop to expand.
+$uvEnv = @{
+    'UV_PROJECT_ENVIRONMENT' = '${HOME}/.punch-shim/venv'
+    'UV_CACHE_DIR'           = '${HOME}/.punch-shim/uv-cache'
+    'UV_PYTHON_INSTALL_DIR'  = '${HOME}/.punch-shim/uv-python'
+}
+if ($man.server -and $man.server.mcp_config) {
+    if (-not $man.server.mcp_config.env) {
+        $man.server.mcp_config | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]@{}) -Force
+    }
+    foreach ($k in $uvEnv.Keys) {
+        $man.server.mcp_config.env | Add-Member -NotePropertyName $k -NotePropertyValue $uvEnv[$k] -Force
+    }
+    Ok "manifest server.env: persistent UV_* paths set under HOME/.punch-shim"
 }
 
 $manJson = ($man | ConvertTo-Json -Depth 10) + "`n"
