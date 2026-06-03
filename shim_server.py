@@ -150,7 +150,12 @@ from mcp.server.fastmcp import Context, FastMCP
 # known-backend transport-error envelopes) is stamped `_shim_served_by`
 # so the client reports which federated backend served a call instead of
 # guessing. Strictly additive; see _enrich_response.
-_SHIM_VERSION = "3.4.0"
+# v3.4.1 — refresh the bundled SAP offline-fallback tools.json to the live
+# pa_v2 catalogue (was a frozen 104-tool V1 snapshot from the 2.4.1 baseline,
+# which the v2 backend doesn't serve). build-mcpb.ps1 now copies the repo's
+# tools.json into the .mcpb so a fresh install's offline fallback is current,
+# not reliant on auto-refresh. No shim logic change.
+_SHIM_VERSION = "3.4.1"
 
 
 # ---------------------------------------------------------------------------

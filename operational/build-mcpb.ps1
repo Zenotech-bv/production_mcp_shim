@@ -75,6 +75,24 @@ Step "Replace shim_server.py"
 Copy-Item -LiteralPath $canonical -Destination (Join-Path $staging 'server\shim_server.py') -Force
 Ok "shim_server.py updated"
 
+Step "Refresh bundled tools.json (SAP offline fallback)"
+# The bundled tools.json is the SAP backend's offline fallback - loaded ONLY
+# when pa_v2 is unreachable at first launch (otherwise the shim fetches /tools
+# live). It MUST track the live catalogue, NOT be frozen at whatever the
+# baseline .mcpb shipped: the 2.4.1 baseline carried a stale 104-tool V1
+# snapshot (get_vendor_aging, ...) which the v2 backend does not even serve.
+# Copy the repo's canonical tools.json. Regenerate it before a release via:
+#   cd C:\claude\punch-analytics
+#   .\.venv\Scripts\python.exe C:\claude\production_mcp_shim\generate_bundled_tools.py
+$repoTools = Join-Path $repoRoot 'tools.json'
+if (Test-Path $repoTools) {
+    Copy-Item -LiteralPath $repoTools -Destination (Join-Path $staging 'server\tools.json') -Force
+    $tj = Get-Content -Raw $repoTools | ConvertFrom-Json
+    Ok ("tools.json refreshed ({0} tools, server_version {1})" -f $tj.count, $tj.server_version)
+} else {
+    Note "no repo tools.json at $repoTools - bundled fallback left as baseline (stale)"
+}
+
 Step "Sync deps from pyproject.toml into requirements.txt"
 $pyprojPath = Join-Path $staging 'pyproject.toml'
 $pyproj = Get-Content -Raw $pyprojPath
