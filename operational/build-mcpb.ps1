@@ -175,17 +175,37 @@ if ($man.user_config -and $man.user_config.punch_sap_key) {
     Note "user_config.punch_sap_key.required -> false (Kerberos is the default)"
 }
 
-# v3.0.6 — overwrite description / long_description from caller args.
-# If the caller passed nothing (empty string), the existing manifest
-# value is preserved — back-compat with the pre-v3.0.6 pattern where
-# this script left description text frozen at the baseline.
+# v3.0.6 / v3.4.2 - description + long_description. Precedence: caller arg >
+# repo file (manifest-description.txt / manifest-long-description.txt) > the
+# baseline value. The repo files are the canonical source so the directory text
+# stops freezing at the baseline (it sat at the v2.4.1 blurb through v3.4.1).
+$descFile = Join-Path $repoRoot 'manifest-description.txt'
+$longFile = Join-Path $repoRoot 'manifest-long-description.txt'
 if ($Description) {
     $man.description = $Description
-    Note "description updated"
+    Note "description: caller arg"
+} elseif (Test-Path $descFile) {
+    $man.description = (Get-Content -Raw $descFile).Trim()
+    Note "description: manifest-description.txt"
 }
 if ($LongDescription) {
     $man.long_description = $LongDescription
-    Note "long_description updated"
+    Note "long_description: caller arg"
+} elseif (Test-Path $longFile) {
+    $man.long_description = (Get-Content -Raw $longFile).Trim()
+    Note "long_description: manifest-long-description.txt"
+}
+
+# v3.4.2 - sync the declared `tools` array from the bundled tools.json so the
+# connector directory shows the CURRENT catalogue, not the baseline's frozen V1
+# set (the 2.4.1 baseline declared 92 get_* V1 tools the v2 backend never serves).
+$repoToolsJson = Join-Path $repoRoot 'tools.json'
+if (Test-Path $repoToolsJson) {
+    $cat = Get-Content -Raw $repoToolsJson | ConvertFrom-Json
+    $man.tools = @($cat.tools | ForEach-Object {
+        [pscustomobject]@{ name = $_.name; description = $_.description }
+    })
+    Ok ("manifest.tools synced from tools.json ({0} tools)" -f $man.tools.Count)
 }
 
 # v3.0.6 — strip `compatibility.runtimes.python`. The bundled `bin/uv.exe`

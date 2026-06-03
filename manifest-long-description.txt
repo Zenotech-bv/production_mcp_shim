@@ -1,0 +1,11 @@
+v3.4.2 - refresh the connector-directory metadata (this description and the tool list) to the current pa_v2 catalogue. Earlier 3.x builds carried the v2.4.1 blurb and the old V1 tool names (get_vendor_aging, ...) because the build only bumped the manifest version and never rewrote these fields. build-mcpb.ps1 now syncs the tool list from the bundled catalogue and reads this text from the repo, so it cannot re-freeze.
+
+v3.4.1 - refresh the bundled offline-fallback catalogue (loaded only when the backend is unreachable at first launch) from a stale 104-tool V1 snapshot to the live 175-tool pa_v2 catalogue, including the R5 G/L tools (pa_extract_bsis, pa_extract_bsas, pa_gl_open_items, pa_gl_account_balance). The online path already fetches the live catalogue at first launch.
+
+v3.4.0 - call-time backend attribution: every response is stamped with which federated backend served it, so a multi-backend setup reports its source instead of guessing.
+
+v3.3.0 - auto-refresh: the shim probes each backend's /health and re-fetches /tools when the server version or tool count changes, so a server-side tool addition appears without a manual reload.
+
+Auth: Kerberos/SPNEGO (negotiate) is the default for human users - the shim mints a SPNEGO token from your Windows logon via SSPI, so there is no key on disk. Service identities (headless callers) can still set an X-Punch-Auth key per backend in backends.json.
+
+Requires a domain-joined machine for Kerberos and the punch-analytics server (http://ai.punchpowertrain.com:3000).

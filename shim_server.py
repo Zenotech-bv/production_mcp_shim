@@ -155,7 +155,13 @@ from mcp.server.fastmcp import Context, FastMCP
 # which the v2 backend doesn't serve). build-mcpb.ps1 now copies the repo's
 # tools.json into the .mcpb so a fresh install's offline fallback is current,
 # not reliant on auto-refresh. No shim logic change.
-_SHIM_VERSION = "3.4.1"
+# v3.4.2 — refresh the connector-directory manifest metadata (description,
+# long_description, and the declared `tools` array) to the current pa_v2
+# catalogue. Prior 3.x builds only bumped manifest.version, so the directory
+# showed the v2.4.1 blurb + 92 V1 tool names. build-mcpb.ps1 now reads the
+# description from manifest-{description,long-description}.txt and syncs the
+# tools array from the bundled tools.json. No shim logic change.
+_SHIM_VERSION = "3.4.2"
 
 
 # ---------------------------------------------------------------------------
