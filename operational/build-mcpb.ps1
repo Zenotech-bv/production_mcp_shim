@@ -111,7 +111,15 @@ $pyprojPath = Join-Path $staging 'pyproject.toml'
 $pyproj = Get-Content -Raw $pyprojPath
 $depMatch = [regex]::Match($pyproj, '(?ms)dependencies\s*=\s*\[(.*?)\]')
 if ($depMatch.Success) {
-    $deps = [regex]::Matches($depMatch.Groups[1].Value, '"([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
+    # v3.4.4 — match each array element as a whole-line quoted string (double OR
+    # single quoted) instead of `"([^"]+)"`. The old pattern grabbed the INNER
+    # "win32" out of the single-quoted entry 'pywin32 ; sys_platform == "win32"',
+    # yielding a phantom `win32` dep; the pywin32 presence-check below then
+    # failed (it saw "win32", not "pywin32") and re-injected pywin32, corrupting
+    # the staged pyproject.toml + requirements.txt with a non-existent package.
+    $deps = [regex]::Matches($depMatch.Groups[1].Value, '(?m)^\s*(?:\x22([^\x22]*)\x22|''([^'']*)'')\s*,?\s*$') | ForEach-Object {
+        if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value }
+    }
 
     # v3.2.1 — bake pywin32 into every Windows install. The Python mcp SDK's
     # client/stdio submodule imports pywintypes (from pywin32) on Windows;
@@ -161,6 +169,23 @@ Step "Update manifest.json (version + descriptions + bundled-runtime flag)"
 $manPath = Join-Path $staging 'manifest.json'
 $man = Get-Content -Raw $manPath | ConvertFrom-Json
 $man.version = $Version
+
+# v3.4.4 — emit the current MCPB schema key. Every baseline since 2.4.1 carried
+# `dxt_version: "0.1"` (the old DXT-era key), and this script only ever rewrote
+# `version`, so it silently propagated into every build. Claude Desktop
+# 1.12603.x no longer parses the `server` block from a `dxt_version` manifest —
+# it logs "not a Node.js server or a Python server or no entry point specified",
+# falls back to basic execution, and the packed-.mcpb one-click install stops
+# completing (only a hand-extracted copy ran). The MCPB spec replaced the key
+# with `manifest_version` (currently "0.3"). Drop the legacy key and write the
+# new one as the FIRST property so the directory/installer reads it up front.
+$MANIFEST_SCHEMA_VERSION = '0.3'
+$man.PSObject.Properties.Remove('dxt_version')
+$man.PSObject.Properties.Remove('manifest_version')
+$ordered = [ordered]@{ manifest_version = $MANIFEST_SCHEMA_VERSION }
+foreach ($p in $man.PSObject.Properties) { $ordered[$p.Name] = $p.Value }
+$man = [pscustomobject]$ordered
+Note "manifest schema key -> manifest_version: $MANIFEST_SCHEMA_VERSION (was dxt_version)"
 
 # v3.0.6 — overwrite user_config.punch_sap_url.default (was frozen at
 # v1's mcp.punchpowertrain.com in the v2.4.1 baseline; v3.0.1 was

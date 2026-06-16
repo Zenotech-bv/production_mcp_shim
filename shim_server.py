@@ -170,7 +170,16 @@ from mcp.server.fastmcp import Context, FastMCP
 # PERSIST across updates (update -> reuse, not rebuild), and ship a uv.lock so
 # `uv run` skips re-resolution. First install still pays once; updates after are
 # seconds. No shim logic change.
-_SHIM_VERSION = "3.4.3"
+# v3.4.4 — one-click install fix. Claude Desktop 1.12603.x stopped recognising
+# the legacy DXT manifest key: with `dxt_version` present (and no
+# `manifest_version`), the installer can't identify the server block ("not a
+# Node.js server or a Python server or no entry point specified" -> falls back
+# to basic execution) and the packed-.mcpb one-click install no longer
+# completes — only a hand-extracted copy ran. build-mcpb.ps1 now emits the
+# current MCPB key `manifest_version: "0.3"` instead of `dxt_version: "0.1"`,
+# which every build had silently inherited from the 2.4.1 baseline. No shim
+# logic change.
+_SHIM_VERSION = "3.4.4"
 
 
 # ---------------------------------------------------------------------------
