@@ -179,7 +179,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # current MCPB key `manifest_version: "0.3"` instead of `dxt_version: "0.1"`,
 # which every build had silently inherited from the 2.4.1 baseline. No shim
 # logic change.
-_SHIM_VERSION = "3.4.4"
+_SHIM_VERSION = "3.4.5"
 
 
 # ---------------------------------------------------------------------------
@@ -636,9 +636,25 @@ _DEFAULT_BACKENDS_TEMPLATE: dict = {
             "url":    "http://ai.punchpowertrain.com:3002",
             "auth":   "negotiate",
         },
+        {
+            "name":   "rd",
+            "url":    "http://ai.punchpowertrain.com:3010",
+            "auth":   "negotiate",
+        },
+        {
+            "name":   "tutorials",
+            "url":    "http://ai.punchpowertrain.com:3015",
+            "auth":   "negotiate",
+        },
     ],
     "primary": "sap",
 }
+
+# v3.4.5 — backends that honour the X-Punch-Auth header (resolved against
+# pa_users). Only these get converted to x-punch-auth + the env-var key in the
+# service-identity seed branch. rd is Kerberos-only (no X-Punch-Auth path) and
+# tutorials is no-auth, so both stay auth=negotiate regardless of PUNCH_SAP_KEY.
+_XPUNCH_AUTH_CAPABLE = frozenset({"sap", "zabbix"})
 
 
 # v3.0.5 — v1 was retired at the v0.0.115/116 Kerberos cutover. Laptops
@@ -725,8 +741,10 @@ def _maybe_seed_backends_file(cfg_path: Path) -> bool:
         return False
 
     if PUNCH_SAP_KEY:
-        # Service-identity: override the template to x-punch-auth and
-        # bake the env-var key into every entry.
+        # Service-identity: bake the env-var key into the X-Punch-Auth-capable
+        # backends (sap, zabbix). rd / tutorials stay negotiate as in the
+        # template — stamping the SAP key onto rd via x-punch-auth would break
+        # it (rd is Kerberos-only), and tutorials ignores auth entirely.
         seed: dict = {
             "backends": [
                 {
@@ -736,14 +754,17 @@ def _maybe_seed_backends_file(cfg_path: Path) -> bool:
                     "header": "X-Punch-Auth",
                     "key":    PUNCH_SAP_KEY,
                 }
+                if entry["name"] in _XPUNCH_AUTH_CAPABLE
+                else dict(entry)
                 for entry in _DEFAULT_BACKENDS_TEMPLATE["backends"]
             ],
             "primary": _DEFAULT_BACKENDS_TEMPLATE["primary"],
         }
         seed_note = (
-            "first-run auto-create; PUNCH_SAP_KEY env var present so "
-            "every backend was seeded with auth=x-punch-auth and that "
-            "key. Edit the file to issue per-backend keys."
+            "first-run auto-create; PUNCH_SAP_KEY env var present so the "
+            "X-Punch-Auth-capable backends (sap, zabbix) were seeded with "
+            "auth=x-punch-auth and that key; rd / tutorials stay negotiate. "
+            "Edit the file to issue per-backend keys."
         )
     else:
         # Kerberos default: template as-is, auth=negotiate, no key. Pre-

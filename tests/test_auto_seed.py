@@ -44,8 +44,26 @@ def test_seed_writes_kerberos_template_when_no_key(tmp_path, monkeypatch):
         )
 
 
-def test_seed_writes_x_punch_auth_template_when_key_present(tmp_path, monkeypatch):
-    """PUNCH_SAP_KEY set -> every backend seeded with auth=x-punch-auth + key."""
+def test_seed_includes_all_four_backends_kerberos(tmp_path, monkeypatch):
+    """v3.4.5: the default template carries all four internal backends
+    (sap, zabbix, rd, tutorials) so a fresh install knows about them out of
+    the box, consistent with the supervisor discovery list + installer seed."""
+    shim = _import_shim()
+    monkeypatch.setattr(shim, "PUNCH_SAP_KEY", "")
+    cfg = tmp_path / "backends.json"
+    shim._maybe_seed_backends_file(cfg)
+    seed = json.loads(cfg.read_text(encoding="utf-8"))
+    names = {b["name"] for b in seed["backends"]}
+    assert names == {"sap", "zabbix", "rd", "tutorials"}
+    for b in seed["backends"]:
+        assert b["auth"] == "negotiate"
+
+
+def test_seed_x_punch_auth_only_converts_capable_backends(tmp_path, monkeypatch):
+    """PUNCH_SAP_KEY set -> only X-Punch-Auth-capable backends (sap, zabbix)
+    get the key; rd is Kerberos-only and tutorials is no-auth, so both stay
+    auth=negotiate with no key baked in. Stamping the SAP key onto rd via
+    x-punch-auth would break it (rd has no X-Punch-Auth path)."""
     shim = _import_shim()
     test_key = "ak_test_padded_to_pass_placeholder_guard_xxxx"
     monkeypatch.setattr(shim, "PUNCH_SAP_KEY", test_key)
@@ -55,10 +73,14 @@ def test_seed_writes_x_punch_auth_template_when_key_present(tmp_path, monkeypatc
 
     assert wrote is True
     seed = json.loads(cfg.read_text(encoding="utf-8"))
-    for b in seed["backends"]:
-        assert b["auth"] == "x-punch-auth"
-        assert b["header"] == "X-Punch-Auth"
-        assert b["key"] == test_key
+    by_name = {b["name"]: b for b in seed["backends"]}
+    for n in ("sap", "zabbix"):
+        assert by_name[n]["auth"] == "x-punch-auth"
+        assert by_name[n]["header"] == "X-Punch-Auth"
+        assert by_name[n]["key"] == test_key
+    for n in ("rd", "tutorials"):
+        assert by_name[n]["auth"] == "negotiate"
+        assert "key" not in by_name[n]
 
 
 def test_seed_does_not_overwrite_existing_file(tmp_path, monkeypatch):

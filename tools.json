@@ -50,6 +50,14 @@
         "additionalProperties": false,
         "description": "pa_extract_bsik — BSIK open vendor items. `bukrs` is required: BSIK is a\nlarge transactional table and an unscoped pull would hammer SAP. Date\nfilters are ISO YYYY-MM-DD; the extractor converts to SAP YYYYMMDD (CC-6).",
         "properties": {
+          "extra_fields": {
+            "description": "Optional list of extra SAP field names (upper-case, e.g. ['VBUND','XREF1']) to append to this extract's projection beyond the table's core columns; they land as TEXT columns. The combined projection must fit SAP's ~512-byte row limit. Use to pull an occasionally-needed column without a schema change.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Extra Fields",
+            "type": "array"
+          },
           "bukrs": {
             "title": "Bukrs",
             "type": "string"
@@ -99,6 +107,14 @@
         "additionalProperties": false,
         "description": "pa_extract_bsid — BSID open customer items. The AR mirror of\nExtractBsikArgs: `bukrs` required (same large-table reasoning), `kunnr_in`\nin place of `lifnr_in`. Date filters are ISO YYYY-MM-DD (CC-6).",
         "properties": {
+          "extra_fields": {
+            "description": "Optional list of extra SAP field names (upper-case, e.g. ['VBUND','XREF1']) to append to this extract's projection beyond the table's core columns; they land as TEXT columns. The combined projection must fit SAP's ~512-byte row limit. Use to pull an occasionally-needed column without a schema change.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Extra Fields",
+            "type": "array"
+          },
           "bukrs": {
             "title": "Bukrs",
             "type": "string"
@@ -148,6 +164,14 @@
         "additionalProperties": false,
         "description": "pa_extract_bsak — BSAK cleared vendor items (cleared AP). The cleared-\nside mirror of ExtractBsikArgs: `bukrs` required, `budat_from`/`budat_to`\nbound the (potentially huge) cleared history. Date filters ISO YYYY-MM-DD.",
         "properties": {
+          "extra_fields": {
+            "description": "Optional list of extra SAP field names (upper-case, e.g. ['VBUND','XREF1']) to append to this extract's projection beyond the table's core columns; they land as TEXT columns. The combined projection must fit SAP's ~512-byte row limit. Use to pull an occasionally-needed column without a schema change.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Extra Fields",
+            "type": "array"
+          },
           "bukrs": {
             "title": "Bukrs",
             "type": "string"
@@ -197,6 +221,14 @@
         "additionalProperties": false,
         "description": "pa_extract_bsad — BSAD cleared customer items (cleared AR). The AR\nmirror of ExtractBsakArgs: `kunnr_in` in place of `lifnr_in`.",
         "properties": {
+          "extra_fields": {
+            "description": "Optional list of extra SAP field names (upper-case, e.g. ['VBUND','XREF1']) to append to this extract's projection beyond the table's core columns; they land as TEXT columns. The combined projection must fit SAP's ~512-byte row limit. Use to pull an occasionally-needed column without a schema change.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Extra Fields",
+            "type": "array"
+          },
           "bukrs": {
             "title": "Bukrs",
             "type": "string"
@@ -246,6 +278,14 @@
         "additionalProperties": false,
         "description": "pa_extract_bsis — BSIS open G/L items, keyed by HKONT. The G/L-account\nanalogue of ExtractBsikArgs: `bukrs` required (large transactional table),\n`hkont_in` an optional G/L-account include list (human or padded form;\nthe WHERE-builder zero-pads to CHAR(10)). Open side -> lower-bound dates\nonly. Date filters ISO YYYY-MM-DD (CC-6).",
         "properties": {
+          "extra_fields": {
+            "description": "Optional list of extra SAP field names (upper-case, e.g. ['VBUND','XREF1']) to append to this extract's projection beyond the table's core columns; they land as TEXT columns. The combined projection must fit SAP's ~512-byte row limit. Use to pull an occasionally-needed column without a schema change.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Extra Fields",
+            "type": "array"
+          },
           "bukrs": {
             "title": "Bukrs",
             "type": "string"
@@ -295,6 +335,14 @@
         "additionalProperties": false,
         "description": "pa_extract_bsas — BSAS cleared G/L items, keyed by HKONT. The cleared-\nside mirror of ExtractBsisArgs: `bukrs` required, `budat_from`/`budat_to`\nbound the (potentially huge) cleared history. Stage it (alongside BSIS)\nfor the pa_gl_open_items as-at-key-date view. Date filters ISO YYYY-MM-DD.",
         "properties": {
+          "extra_fields": {
+            "description": "Optional list of extra SAP field names (upper-case, e.g. ['VBUND','XREF1']) to append to this extract's projection beyond the table's core columns; they land as TEXT columns. The combined projection must fit SAP's ~512-byte row limit. Use to pull an occasionally-needed column without a schema change.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Extra Fields",
+            "type": "array"
+          },
           "bukrs": {
             "title": "Bukrs",
             "type": "string"
@@ -334,6 +382,110 @@
           "bukrs"
         ],
         "title": "ExtractBsasArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_bsis_group",
+      "description": "Extract SAP BSIS (open G/L) for MULTIPLE company codes (bukrs_in) into pa_<user>.bsis_grp (replace mode, bukrs-tagged) — the multi-CC staging pa_gl_group_overview needs, without clobbering the single-CC bsis. Refresh BROAD (pass every CC in one call), query narrow. hkont_in/bldat_from/budat_from scope the (large) pull. Each bukrs ACL-gated.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_bsis_group — stage BSIS (open G/L items) for MULTIPLE company\ncodes into pa_<user>.bsis_grp (bukrs-tagged), so pa_gl_group_overview works\nwithout the single-CC bsis clobber. Each bukrs is ACL-gated. Refresh BROAD\n(pass EVERY CC you want in ONE call — replace-mode rebuilds bsis_grp), query\nnarrow. hkont_in/date bounds keep the (large) pull scoped.",
+        "properties": {
+          "bukrs_in": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Bukrs In",
+            "type": "array"
+          },
+          "hkont_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Hkont In"
+          },
+          "bldat_from": {
+            "default": "",
+            "title": "Bldat From",
+            "type": "string"
+          },
+          "budat_from": {
+            "default": "",
+            "title": "Budat From",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bukrs_in"
+        ],
+        "title": "ExtractBsisGroupArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_bsas_group",
+      "description": "BSAS (cleared G/L) group mirror of pa_extract_bsis_group -> pa_<user>.bsas_grp (multi-CC, bukrs-tagged). budat_from/budat_to bound the cleared history. Stage alongside bsis_grp for pa_gl_group_overview across company codes.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_bsas_group — BSAS (cleared G/L) group mirror of\nExtractBsisGroupArgs -> pa_<user>.bsas_grp. budat_from/budat_to bound the\n(potentially huge) cleared history. Refresh broad, query narrow.",
+        "properties": {
+          "bukrs_in": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Bukrs In",
+            "type": "array"
+          },
+          "hkont_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Hkont In"
+          },
+          "budat_from": {
+            "default": "",
+            "title": "Budat From",
+            "type": "string"
+          },
+          "budat_to": {
+            "default": "",
+            "title": "Budat To",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bukrs_in"
+        ],
+        "title": "ExtractBsasGroupArgs",
         "type": "object"
       }
     },
@@ -557,6 +709,768 @@
           }
         },
         "title": "ExtractT001Args",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_ska1",
+      "description": "Extract SAP SKA1 (chart-of-accounts G/L master) into pa_<user>.ska1 (replace mode). No scope arg; optional ktopl restricts to one chart (e.g. 'YCBE'). The group->operational account map: SKA1.BILKT is the GROUP account, SKA1.SAKNR the OPERATIONAL account (= the HKONT on BSIS/BSAS). Stage it for pa_gl_group_overview (group M11745 = the IC current-account group -> ~16 operational accounts in YCBE).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_ska1 — SKA1 (chart-of-accounts G/L master). No org-unit scope\narg (SKA1 is keyed by chart of accounts, not company code). The OPTIONAL\n`ktopl` filter restricts the pull to one chart (e.g. 'YCBE'). Validation of\nthe filter lives in build_ska1_where, not pydantic (the ExtractBsik note:\nthe WHERE-builder owns the SAP-literal regex gate).",
+        "properties": {
+          "ktopl": {
+            "default": "",
+            "title": "Ktopl",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "title": "ExtractSka1Args",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_skat",
+      "description": "Extract SAP SKAT (chart-of-accounts G/L account texts) into pa_<user>.skat (replace mode). No scope arg; optional spras (language, e.g. 'E') + ktopl filters narrow the pull. Carries TXT20/TXT50 account descriptions keyed by (SPRAS, KTOPL, SAKNR). The text overlay for pa_gl_group_overview (account_text) — stage with spras='E'.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_skat — SKAT (chart-of-accounts G/L account texts). No org-unit\nscope arg (SKAT is keyed by language + chart of accounts). The OPTIONAL\n`spras` + `ktopl` filters narrow the pull (e.g. spras='E', ktopl='YCBE').\nValidation of the filters lives in build_skat_where, not pydantic.",
+        "properties": {
+          "spras": {
+            "default": "",
+            "title": "Spras",
+            "type": "string"
+          },
+          "ktopl": {
+            "default": "",
+            "title": "Ktopl",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "title": "ExtractSkat1Args",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_mara",
+      "description": "Extract SAP MARA (material master general data) into pa_<user>.mara (replace mode). No required scope: MARA is a small master-data table (one row per material). matnr_in optionally restricts to a subset of materials. Carries MTART (material type), MATKL (material group), MEINS (base UOM), MBRSH (industry sector). Stage before MARC/MARD/MBEW for the full inventory picture.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_mara -- MARA material master (general / client level). No\nrequired scope: MARA is a small master-data table. `matnr_in` optionally\nrestricts to a set of material numbers. Accepts the human form\n(MAT-001, 10/02) -- the WHERE builder validates but does not pad.",
+        "properties": {
+          "matnr_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Matnr In"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "title": "ExtractMaraArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_marc",
+      "description": "Extract SAP MARC (material plant data) into pa_<user>.marc (replace mode). werks required (large table). Carries EKGRP (purchasing group), DISPO (MRP controller) per (MATNR, WERKS). matnr_in optionally narrows to a subset.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_marc -- MARC material plant data. `werks` is required\n(large table; one row per (MATNR, WERKS)). `matnr_in` optionally narrows\nto a subset of materials.",
+        "properties": {
+          "werks": {
+            "title": "Werks",
+            "type": "string"
+          },
+          "matnr_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Matnr In"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "werks"
+        ],
+        "title": "ExtractMarcArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_mard",
+      "description": "Extract SAP MARD (storage-location stock) into pa_<user>.mard (replace mode). Scope: exactly ONE of werks (single plant) or werks_in (multi-plant -- the REQUIRED staging path for the company-code rollup: replace mode wipes sibling plants, so stage every CC plant together). Carries all SIX stock buckets per (MATNR, WERKS, LGORT) -- unrestricted (LABST), QI (INSME), blocked (SPEME), in transfer (UMLME), restricted (EINME), returns (RETME) -- typed NUMERIC, plus ERSDA (segment creation date; drives the as-at creation guard) and LFGJA/LFMON = last-movement period (INTEGER; dormant-stock detection). For as-at queries stage TOGETHER with pa_extract_mardh (same plants). Feed pa_stock_on_hand after staging.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_mard -- MARD storage-location stock. Exactly ONE of `werks`\n(single plant -- the PR1 surface, unchanged) or `werks_in` (multi-plant)\nis required; one row per (MATNR, WERKS, LGORT). `matnr_in` optionally\nnarrows to a subset of materials. Stock buckets are typed NUMERIC.\n\nMulti-plant staging (`werks_in`) exists because the CC rollup needs\nsibling plants staged TOGETHER: extracts are replace-mode, so a\nsingle-plant extract wipes the sibling plants' rows, and a BUKRS-level\nrollup (e.g. company code 1000 spans plants {1000, 1010, 1100}) must\npull all of them in one extract.",
+        "properties": {
+          "werks": {
+            "default": "",
+            "title": "Werks",
+            "type": "string"
+          },
+          "werks_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Werks In"
+          },
+          "matnr_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Matnr In"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "title": "ExtractMardArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_mbew",
+      "description": "Extract SAP MBEW (material valuation) into pa_<user>.mbew (replace mode). Scope: exactly ONE of bwkey (single valuation area, usually = plant) or bwkey_in (multi-area -- required for the company-code rollup: replace mode wipes sibling areas, so stage every CC valuation area together). Carries LBKUM (total stock qty), SALK3 (total stock value LC), VPRSV (S=standard/V=moving-avg price control), STPRS (standard price), VERPR (moving-avg price), PEINH (price unit), BKLAS (valuation class) — all NUMERIC qty/value cols pre-typed. For as-at queries stage TOGETHER with pa_extract_mbewh (same valuation areas). Feed pa_inventory_value_summary.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_mbew -- MBEW material valuation. Exactly ONE of `bwkey`\n(single valuation area, usually = plant -- the PR1 surface, unchanged)\nor `bwkey_in` (multi-area) is required. `matnr_in` optionally narrows to\na subset of materials. LBKUM/SALK3/STPRS/VERPR/PEINH are typed NUMERIC.\n\nMulti-area staging (`bwkey_in`) mirrors ExtractMardArgs.werks_in: the\nCC rollup needs sibling valuation areas staged together (replace-mode\nextracts wipe whatever isn't in the current pull).",
+        "properties": {
+          "bwkey": {
+            "default": "",
+            "title": "Bwkey",
+            "type": "string"
+          },
+          "bwkey_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Bwkey In"
+          },
+          "matnr_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Matnr In"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "title": "ExtractMbewArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_t001w",
+      "description": "Extract SAP T001W (plant master) into pa_<user>.t001w (replace mode). No required scope: tiny config table (one row per plant). werks_in optionally restricts to a subset of plants. Carries NAME1 (plant description) and BWKEY (valuation area) — the join key between MARC/MARD (werks-keyed) and MBEW (bwkey-keyed).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_t001w -- T001W plant master. No required scope: the table\nis tiny (one row per plant). `werks_in` optionally restricts to a subset\nof plants. The join key between MARC/MARD (werks-keyed) and MBEW\n(bwkey-keyed).",
+        "properties": {
+          "werks_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Werks In"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "title": "ExtractT001wArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_mardh",
+      "description": "Extract SAP MARDH (storage-location stock HISTORY) into pa_<user>.mardh (replace mode). Month-end history rows (lazy before-images) for pa_stock_on_hand's as-at view — stage TOGETHER with pa_extract_mard (same plants), plus mbew+mbewh for valuation. werks_in required; lfgja_from ('YYYY') bounds the pull to the analysis horizon. All six stock buckets NUMERIC; zero rows are data (stock was zero at month end) and are never filtered.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_mardh -- MARDH storage-location stock HISTORY (lazy\nbefore-image rows: a row stamped (LFGJA, LFMON)=P holds the segment's\nstock at the END of period P; absent period = unchanged). `werks_in` is\nrequired non-empty -- histories are BSAK-class pulls and the as-at\nanalytical needs the CC's sibling plants staged together. `lfgja_from`\n(\"YYYY\", validated in the WHERE builder) bounds the pull to the analysis\nhorizon. The builder never filters stock buckets: zero rows are data.",
+        "properties": {
+          "werks_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Werks In"
+          },
+          "matnr_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Matnr In"
+          },
+          "lfgja_from": {
+            "default": "",
+            "title": "Lfgja From",
+            "type": "string"
+          }
+        },
+        "required": [
+          "werks_in"
+        ],
+        "title": "ExtractMardhArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_mbewh",
+      "description": "Extract SAP MBEWH (material-valuation HISTORY) into pa_<user>.mbewh (replace mode). Month-end history rows (lazy before-images) for the as-at valuation — stage TOGETHER with pa_extract_mbew (same valuation areas), plus mard+mardh for quantities. bwkey_in required; lfgja_from ('YYYY') bounds the pull. Period coverage is independent of MARDH (never joined on period); zero rows are data and are never filtered.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_mbewh -- MBEWH material-valuation HISTORY (lazy\nbefore-image rows, same semantics as MARDH but stamped independently --\nnever join the two on (LFGJA, LFMON)). `bwkey_in` is required non-empty.\n`lfgja_from` (\"YYYY\", validated in the WHERE builder) bounds the pull.",
+        "properties": {
+          "bwkey_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bwkey In"
+          },
+          "matnr_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Matnr In"
+          },
+          "lfgja_from": {
+            "default": "",
+            "title": "Lfgja From",
+            "type": "string"
+          }
+        },
+        "required": [
+          "bwkey_in"
+        ],
+        "title": "ExtractMbewhArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_t001k",
+      "description": "Extract SAP T001K (valuation area -> company code bridge) into pa_<user>.t001k (replace mode). Tiny config table, no scope arg. The BWKEY->BUKRS map that lets the stock analyticals roll plant figures up to company-code level (with t001 for the CC currency).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_t001k -- T001K (valuation-area -> company-code bridge).\nNo args: the table is tiny (one row per BWKEY) and the whole point is\nthe complete BWKEY->BUKRS map for the CC rollup (t001.py shape).",
+        "properties": {},
+        "title": "ExtractT001kArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_anla",
+      "description": "Extract SAP ANLA (asset master) into pa_<user>.anla (replace mode). bukrs required. One row per asset (ANLN1/ANLN2) with class (ANLKL), description (TXT50), capitalisation (AKTIV) and deactivation (DEAKT) dates -- DEAKT NULL = active. Stage TOGETHER with pa_extract_anlc/anlz/anlb/ankt (same bukrs), then feed pa_asset_register.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_anla -- ANLA asset master (general data). `bukrs` is\nrequired: asset tables are genuinely CC-keyed (standard cc_arg gate,\nunlike the plant-keyed stock family). One row per (BUKRS, ANLN1, ANLN2)\ncarrying the asset class, description and capitalisation / deactivation\ndates the register reads.",
+        "properties": {
+          "bukrs": {
+            "title": "Bukrs",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bukrs"
+        ],
+        "title": "ExtractAnlaArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_anlc",
+      "description": "Extract SAP ANLC (asset year values) into pa_<user>.anlc (replace mode). bukrs required; gjahr_from ('YYYY') optionally bounds the pull. One row per asset x fiscal year x depreciation area (AFABE '01' = book) carrying the APC / accumulated-depreciation value fields (NUMERIC) the NBV formula reads. Stage TOGETHER with pa_extract_anla (same bukrs).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_anlc -- ANLC asset value fields (one row per asset x\nfiscal year x depreciation area). `bukrs` required. `gjahr_from`\n(\"YYYY\", builder-validated) bounds the pull to the analysis horizon --\nthe NBV register reads only the latest staged year, but staging history\nnow means PR4's as-at view needs no re-extract.",
+        "properties": {
+          "bukrs": {
+            "title": "Bukrs",
+            "type": "string"
+          },
+          "gjahr_from": {
+            "default": "",
+            "title": "Gjahr From",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bukrs"
+        ],
+        "title": "ExtractAnlcArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_anlz",
+      "description": "Extract SAP ANLZ (time-dependent asset assignments) into pa_<user>.anlz (replace mode). bukrs required. Cost centre (KOSTL), plant, location per validity window (ADATU <= d <= BDATU; 9999-12-31 = open end). Stage TOGETHER with pa_extract_anla (same bukrs) for the register's cost-centre columns / filter.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_anlz -- ANLZ time-dependent asset assignments (cost\ncentre, plant, location). `bukrs` required. Validity windows are\nADATU <= d <= BDATU with 9999-12-31 as the open end; the register picks\nthe currently-valid row.",
+        "properties": {
+          "bukrs": {
+            "title": "Bukrs",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bukrs"
+        ],
+        "title": "ExtractAnlzArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_anlb",
+      "description": "Extract SAP ANLB (depreciation terms) into pa_<user>.anlb (replace mode). bukrs required. Depreciation key (AFASL), useful life (NDJAR years / NDPER periods, INTEGER) and depreciation start (AFABG) per (asset, depreciation area, validity interval -- BDATU end date; the register reads the interval covering today). Stage TOGETHER with pa_extract_anla (same bukrs).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_anlb -- ANLB depreciation terms per (asset, depreciation\narea): depreciation key AFASL, useful life NDJAR/NDPER, depreciation\nstart AFABG. `bukrs` required.",
+        "properties": {
+          "bukrs": {
+            "title": "Bukrs",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bukrs"
+        ],
+        "title": "ExtractAnlbArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_ankt",
+      "description": "Extract SAP ANKT (asset-class texts) into pa_<user>.ankt (replace mode). Tiny text table, no args -- always pulls the English AND German rows (live data has German-only classes; readers prefer E, fall back to D). Stage alongside pa_extract_anla for class descriptions.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_ankt -- ANKT asset-class texts. No args: tiny text table\n(the T001K shape); the extract always pulls the English AND German rows\n(live data has German-only classes) for the whole class catalogue.",
+        "properties": {},
+        "title": "ExtractAnktArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_anep",
+      "description": "Extract SAP ANEP (asset transaction line items) into pa_<user>.anep (replace mode). bukrs required; gjahr_from ('YYYY') optionally bounds the pull. One row per asset transaction (acquisition / retirement / transfer) carrying the SIGNED amount (ANBTR), period (PERAF) and value date (BZDAT). SAP equivalent: AW01N transactions tab / AB03. Stage with pa_extract_anlc for as-at NBV.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_anep -- ANEP asset transaction line items (acquisitions,\nretirements, transfers). `bukrs` required. `gjahr_from` (\"YYYY\",\nbuilder-validated) bounds the pull to the analysis horizon -- the PR4\nas-at view sums ANEP.ANBTR through a target period, so a multi-year\nstage lets the as-at query reconstruct any past period without a\nre-extract. Stage TOGETHER with pa_extract_anlc for the as-at NBV.",
+        "properties": {
+          "bukrs": {
+            "title": "Bukrs",
+            "type": "string"
+          },
+          "gjahr_from": {
+            "default": "",
+            "title": "Gjahr From",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bukrs"
+        ],
+        "title": "ExtractAnepArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_anlp",
+      "description": "Extract SAP ANLP (periodic depreciation) into pa_<user>.anlp (replace mode). bukrs required; gjahr_from ('YYYY') optionally bounds the pull. One row per asset x period x depreciation area (AFABER). SAP equivalent: depreciation-posted view. NAFAP=PLANNED annual (not per-period); disclosure only. Accumulated depreciation comes from ANLC.NAFAG, never the sum of ANLP rows.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_anlp -- ANLP posted/planned periodic depreciation. `bukrs`\nrequired. `gjahr_from` (\"YYYY\", builder-validated) bounds the pull.\nNAFAP is PLANNED ANNUAL depreciation (constant per period row), NOT\nposted-per-period -- staged for the PR4 planned-vs-posted disclosure\ncolumn only; accumulated depreciation comes from ANLC.NAFAG.",
+        "properties": {
+          "bukrs": {
+            "title": "Bukrs",
+            "type": "string"
+          },
+          "gjahr_from": {
+            "default": "",
+            "title": "Gjahr From",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bukrs"
+        ],
+        "title": "ExtractAnlpArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_mseg",
+      "description": "Extract SAP MSEG (material document line items) into pa_<user>.mseg (replace mode). SAP equivalent: MB51 / MB03. Plant + date-window scoped: werks AND budat_from required (BUDAT_MKPF is the denormalized posting date; budat_to optionally closes the window, bwart_in narrows to a movement-type set). One row per (MBLNR, MJAHR, ZEILE) with BWART, signed MENGE/DMBTR (NUMERIC) + SHKZG (S/H), SOBKZ/GRUND/SGTXT, AUFNR/KOSTL/LIFNR/SAKTO. MSEG is one of SAP's largest tables -- the required window keeps the pull bounded. Stage mkpf + t156t for header / movement-type-text overlays, then feed pa_material_movements / pa_scrap_analysis.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_mseg -- MSEG material document line items. Plant + posting-\ndate window scoped: MSEG is one of SAP's largest tables, so `werks` AND\n`budat_from` are BOTH required (BUDAT_MKPF is the denormalized posting\ndate; no two-step MKPF join needed for the window). `budat_to` optionally\ncloses the window; `bwart_in` optionally narrows to a movement-type set.\n\nDate args stay plain str -- build_mseg_where owns the ISO->SAP YYYYMMDD\ncoercion and validation (the same path as the financial extractors; NOT\nIsoDateStr -- that is the analytical-side I-16 fix, the two paths must not\nboth validate).",
+        "properties": {
+          "werks": {
+            "title": "Werks",
+            "type": "string"
+          },
+          "budat_from": {
+            "title": "Budat From",
+            "type": "string"
+          },
+          "budat_to": {
+            "default": "",
+            "title": "Budat To",
+            "type": "string"
+          },
+          "bwart_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Bwart In"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "werks",
+          "budat_from"
+        ],
+        "title": "ExtractMsegArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_mkpf",
+      "description": "Extract SAP MKPF (material document header) into pa_<user>.mkpf (replace mode). SAP equivalent: material document header. Optional overlay for pa_material_movements (blart / usnam / xblnr enrichment). budat_from required (budat_to optional) -- header metadata only, no plant. One row per (MBLNR, MJAHR); stage for the same BUDAT window as the MSEG pull, or omit and those columns degrade to NULL.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_mkpf -- MKPF material document headers. Posting-date window\nscoped (MKPF carries no plant on the header). `budat_from` required;\n`budat_to` optional. Header-metadata overlay for pa_material_movements.\n\nDate args stay plain str -- build_mkpf_where owns the ISO->SAP coercion\n(see ExtractMsegArgs note).",
+        "properties": {
+          "budat_from": {
+            "title": "Budat From",
+            "type": "string"
+          },
+          "budat_to": {
+            "default": "",
+            "title": "Budat To",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "budat_from"
+        ],
+        "title": "ExtractMkpfArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_t156t",
+      "description": "Extract SAP T156T (movement-type texts, EN+DE) into pa_<user>.t156t (replace mode). Optional overlay -- the human-readable label (BTEXT) per (SPRAS, BWART, SOBKZ, KZBEW), e.g. 551 -> 'GI scrapping'. No scope arg (tiny config table; the WHERE is the constant SPRAS IN ('E','D'), English preferred / German fallback). Stage for the movement-type label on pa_material_movements / pa_scrap_analysis, or omit and the label degrades to NULL.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_t156t -- T156T movement-type texts (EN+DE). No scope arg:\nthe WHERE is the CONSTANT SPRAS IN ('E', 'D') (no user input). A tiny\nconfig table; the movement-type label overlay for the movement\nanalyticals (English preferred, German fallback -- the ANKT E-over-D\npattern).",
+        "properties": {
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "title": "ExtractT156tArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_proj",
+      "description": "Extract SAP PROJ (project-definition master) into pa_<user>.proj (replace mode). One row per project (PSPID code, e.g. 'DT2C MSIL'). bukrs optional (small table). Stage with prps/coep/cskb for pa_project_profitability.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_proj -- PROJ (project-definition master). One row per\nproject (PSPNR internal / PSPID code / POST1 description). PROJ is small,\nso `bukrs` is an OPTIONAL filter (rendered as VBUKR = '<bukrs>' only when\nthe VBUKR field is valid on this system); \"\" = the whole table.",
+        "properties": {
+          "bukrs": {
+            "default": "",
+            "title": "Bukrs",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "title": "ExtractProjArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_prps",
+      "description": "Extract SAP PRPS (WBS-element master) into pa_<user>.prps (replace mode). One row per WBS element (OBJNR, level STUFE) linked to its project via PSPHI. pbukr (company code) optional scope. Stage with proj/coep/cskb for pa_project_profitability.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_prps -- PRPS (WBS-element master). One row per WBS element\n(PSPNR / POSID / OBJNR), linked to its project via PSPHI and ranked by\nSTUFE (level). `pbukr` (\"\" = all) scopes to one company code -- the roll-up\nreads PRPS where PSPHI = the resolved project's PSPNR.",
+        "properties": {
+          "pbukr": {
+            "default": "",
+            "title": "Pbukr",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "title": "ExtractPrpsArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_coep",
+      "description": "Extract SAP COEP (CO actual line items) into pa_<user>.coep (replace mode). REQUIRES objnr_in scope (huge table) - the project's WBS objects (resolve via pa_project_profitability's missing-extract hint). kokrs (controlling area, default 1000) and gjahr_from optional. Stage with proj/prps/cskb for pa_project_profitability.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_coep -- COEP (CO actual line items). COEP is HUGE (MSEG\nclass), so it MUST be scoped by `objnr_in` (the project's WBS OBJNRs) --\nthe builder raises if it is empty/None. `kokrs` (controlling area, default\n'1000') and an optional `gjahr_from` (\"YYYY\", builder-validated) bound the\npull further. The analytical resolves the project to its OBJNRs, then names\nthem in the missing_extract hint.",
+        "properties": {
+          "objnr_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Objnr In"
+          },
+          "kokrs": {
+            "default": "1000",
+            "title": "Kokrs",
+            "type": "string"
+          },
+          "gjahr_from": {
+            "default": "",
+            "title": "Gjahr From",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "title": "ExtractCoepArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_cskb",
+      "description": "Extract SAP CSKB (cost-element categories) into pa_<user>.cskb (replace mode). KATYP = revenue vs cost classification (11/12 = revenue, else cost). kokrs (controlling area, default 1000) scope. Stage with proj/prps/coep for pa_project_profitability.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_cskb -- CSKB (cost-element categories). One row per\n(KOKRS, KSTAR, DATBI) carrying KATYP, the revenue-vs-cost classifier\n(11/12 = revenue, else cost). `kokrs` (default '1000') scopes the pull.\nSmall config-class table.",
+        "properties": {
+          "kokrs": {
+            "default": "1000",
+            "title": "Kokrs",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "title": "ExtractCskbArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_jest",
+      "description": "Extract SAP JEST (object system statuses) into pa_<user>.jest (replace mode). REQUIRES objnr_prefix - JEST is huge (a status row for every SAP object). Stage objnr_prefix='PD' for project status (PROJ.OBJNR = 'PD'||PSPNR; a status is active when INACT <> 'X'). Stage with proj/prps for pa_project_list.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_jest -- JEST (object system statuses). JEST is HUGE (one or\nmore status rows for EVERY SAP object), so it MUST be scoped by an OBJNR\nprefix: `objnr_prefix` is REQUIRED and renders as `OBJNR LIKE '<prefix>%'`.\nStage objnr_prefix='PD' for all project-definition statuses (PROJ.OBJNR =\n'PD'||PSPNR). Fields OBJNR/STAT/INACT: a status is ACTIVE when INACT <> 'X'\n(the project-list analytical reads them; TJ02T status TEXTS are NOT granted,\nso the SAP-standard codes are hardcoded there). The builder validates the\nprefix ^[A-Z0-9]{1,8}$ (fail-closed on empty / ' / |).",
+        "properties": {
+          "objnr_prefix": {
+            "title": "Objnr Prefix",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "objnr_prefix"
+        ],
+        "title": "ExtractJestArgs",
         "type": "object"
       }
     },
@@ -4372,7 +5286,7 @@
     },
     {
       "name": "pa_purchase_orders",
-      "description": "List staged EKKO purchase-order headers, LFA1 name-overlaid when staged. Filter by company code / vendor / PO / date.",
+      "description": "List staged EKKO purchase-order headers, LFA1 name-overlaid when staged. Filter by company code / vendor / PO / date. SAP equivalent: ME2N / ME23N.",
       "inputSchema": {
         "additionalProperties": false,
         "description": "pa_purchase_orders — EKKO headers, optional LFA1 name overlay.\n\nPA-V2-SD-001: defaults to the PO order BOOK (BSTYP via\npa_common.po_order_book_bstyps() — F purchase orders + L scheduling\nagreements); RFQs and contracts are excluded so an RFQ/contract is never\nreturned as a purchase order. include_rfq adds BSTYP=A (RFQs);\ninclude_contracts adds BSTYP=K (contracts).",
@@ -4448,7 +5362,7 @@
     },
     {
       "name": "pa_open_purchase_orders",
-      "description": "PO lines with the EKPO/EKKO/EKBE residual (NETWR minus the EKBE invoice-receipt sum — CC-10). only_uninvoiced keeps lines with a non-zero residual. Default `top_n=100`; pass `top_n` to widen.",
+      "description": "PO lines with the EKPO/EKKO/EKBE residual (NETWR minus the EKBE invoice-receipt sum — CC-10). only_uninvoiced keeps lines with a non-zero residual. Default `top_n=100`; pass `top_n` to widen. SAP equivalent: ME2L / ME2M / ME2N (open-PO list by vendor / material / PO).",
       "inputSchema": {
         "additionalProperties": false,
         "description": "pa_open_purchase_orders — PO lines with the EKPO/EKKO/EKBE residual\ncomputation (CC-10). only_uninvoiced (default true) keeps lines with a\nnon-zero residual beyond tolerance_pct; mode picks the residual basis.\n\nPA-V2-SD-001: by default the result is the PO order BOOK — BSTYP restricted\nto pa_common.po_order_book_bstyps() (F purchase orders + L scheduling\nagreements), so RFQs / contracts are never reported as open POs. include_rfq\nadds BSTYP=A; include_contracts adds BSTYP=K.",
@@ -4654,7 +5568,7 @@
     },
     {
       "name": "pa_po_history",
-      "description": "Staged EKBE PO history (GR/IR), joined to EKKO for the company-code / vendor filter. history_type filters BEWTP.",
+      "description": "Staged EKBE PO history (GR/IR), joined to EKKO for the company-code / vendor filter. history_type filters BEWTP. SAP equivalent: ME80FN (PO GR/IR history).",
       "inputSchema": {
         "additionalProperties": false,
         "description": "pa_po_history — EKBE GR/IR history, joined to EKKO for the bukrs/lifnr\nfilter. history_type filters BEWTP.",
@@ -4791,7 +5705,7 @@
     },
     {
       "name": "pa_purchase_requisitions",
-      "description": "Staged EBAN purchase requisitions (filter by plant; open_only keeps un-converted, non-deleted PRs). Default `top_n=100`; pass `top_n` to widen.",
+      "description": "Staged EBAN purchase requisitions (filter by plant; open_only keeps un-converted, non-deleted PRs). Default `top_n=100`; pass `top_n` to widen. SAP equivalent: ME5A.",
       "inputSchema": {
         "additionalProperties": false,
         "description": "pa_purchase_requisitions — EBAN rows. Filtered by `werks` (the WERKS->\nBUKRS rollup needs T001W, which is not yet granted). open_only (default\ntrue) keeps EBELN='' AND LOEKZ=''.",
@@ -5593,7 +6507,7 @@
     },
     {
       "name": "pa_gl_open_items",
-      "description": "Open G/L line items keyed by HKONT (G/L account) from BSIS: one row per open item, aged from the POSTING date BUDAT (days_open) — G/L items have no payment-term due date — with the PLAIN signed amount (no negation; a clearing account's debit/credit sign IS the answer). Answers 'open items on account 411020 in CC1000'. hkont_in accepts 411020 or 0000411020. as_of set => open AT that key date (BSIS UNION BSAS, requires pa_extract_bsas staged, else missing_extract). Returns a table handle; default top_n=100 (widen with top_n, not page_size).",
+      "description": "Open G/L line items keyed by HKONT (G/L account) from BSIS: one row per open item, aged from the POSTING date BUDAT (days_open) — G/L items have no payment-term due date — with the PLAIN signed amount (no negation; a clearing account's debit/credit sign IS the answer). Answers 'open items on account 411020 in CC1000'. hkont_in accepts 411020 or 0000411020. as_of set => open AT that key date (BSIS UNION BSAS, requires pa_extract_bsas staged, else missing_extract). Returns a table handle; default top_n=100 (widen with top_n, not page_size). SAP equivalent: FBL3N.",
       "inputSchema": {
         "additionalProperties": false,
         "description": "pa_gl_open_items — open G/L line items keyed by HKONT, aged from the\nposting date BUDAT (G/L items carry no payment-term due date — spec\nsection 3). Row-shaped (TableHandleResult).\n\n`as_of` \"\" => currently open (BSIS only). When set => open AT that key\ndate = BSIS(BUDAT<=D) UNION ALL BSAS(BUDAT<=D AND AUGDT>D); requires BSAS\nstaged for the same bukrs (else a missing_extract naming pa_extract_bsas —\nnever a silent leg-1-only answer that understates historical exposure).\n\n`hkont_in` accepts the human (411020) or padded (0000411020) account form;\nboth are zero-padded to CHAR(10) before the query. Omit for all staged\nopen-item-managed G/L accounts in the CC.",
@@ -5661,7 +6575,7 @@
     },
     {
       "name": "pa_gl_account_balance",
-      "description": "Net open balance per (HKONT, WAERS) from BSIS (and BSAS for an as_of key date): signed net (NO negation), open-item count, and oldest open BUDAT per G/L account. The 'what is sitting open on this clearing account' roll-up without materialising every line. Same staging as pa_gl_open_items.",
+      "description": "Net open balance per (HKONT, WAERS) from BSIS (and BSAS for an as_of key date): signed net (NO negation), open-item count, and oldest open BUDAT per G/L account. The 'what is sitting open on this clearing account' roll-up without materialising every line. Same staging as pa_gl_open_items. SAP equivalent: FS10N / FAGLB03.",
       "inputSchema": {
         "additionalProperties": false,
         "description": "pa_gl_account_balance — net open balance per (HKONT, WAERS) as of now or\nas at `as_of`, using the same BSIS/BSAS union as pa_gl_open_items. Scalar\nroll-up: signed net (NO negation — a clearing account legitimately sits\ndebit or credit and that sign IS the answer), open-item count, and oldest\nopen BUDAT per account. Same staging requirements as pa_gl_open_items.",
@@ -5695,6 +6609,837 @@
           "bukrs"
         ],
         "title": "GlAccountBalanceArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_gl_group_overview",
+      "description": "Monthly G/L overview rolled up by GROUP account (SKA1.BILKT, e.g. M11745 = the intercompany current-account group). Resolves the group account to its operational accounts (SKA1.SAKNR = HKONT) scoped to each CC's chart (T001.KTOPL), unions BSIS+BSAS (all postings) for the given fiscal year, and aggregates the SIGNED amount (no negation) by month x company code x account x trading partner (VBUND). Args: group_account, bukrs_in, gjahr (all required). Requires ska1/t001/bsis/bsas staged; skat optional (account names). A group resolving to zero accounts returns found=False (clean). Returns a table handle; default top_n=100 (widen with top_n, not page_size). SAP equivalent: FBL3N / FAGLL03.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_gl_group_overview — monthly G/L overview rolled up by GROUP account.\n\nResolves a GROUP account (SKA1.BILKT, e.g. 'M11745' — the intercompany\ncurrent-account group) to its operational G/L accounts (SKA1.SAKNR = the\nHKONT on BSIS/BSAS), scoped to each company code's chart of accounts (the\nchart comes from T001.KTOPL). Then it unions BSIS + BSAS (open + cleared =\nall postings) for those accounts and aggregates the SIGNED amount (no\nnegation — G/L convention, like pa_gl_open_items) by month x company code\nx operational account x trading partner. Row-shaped (TableHandleResult).\n\n`group_account` is the BILKT value to resolve; `bukrs_in` the company codes\n(each ACL-gated at the extract boundary, never here); `gjahr` the fiscal\nyear (e.g. '2026'). A group that resolves to zero operational accounts in\nthe chart(s) returns a clean found=False envelope, not a crash.",
+        "properties": {
+          "top_n": {
+            "default": 0,
+            "title": "Top N",
+            "type": "integer"
+          },
+          "sort_by": {
+            "default": "",
+            "title": "Sort By",
+            "type": "string"
+          },
+          "sort_order": {
+            "default": "desc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "type": "string"
+          },
+          "page_size": {
+            "default": 0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "cursor": {
+            "default": "",
+            "title": "Cursor",
+            "type": "string"
+          },
+          "group_account": {
+            "title": "Group Account",
+            "type": "string"
+          },
+          "bukrs_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Bukrs In"
+          },
+          "gjahr": {
+            "default": "",
+            "title": "Gjahr",
+            "type": "string"
+          }
+        },
+        "required": [
+          "group_account"
+        ],
+        "title": "GlGroupOverviewArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_stock_on_hand",
+      "description": "Current stock x valuation: one row per (MATNR, WERKS, LGORT). Joins MARD (unrestricted LABST, QI INSME, blocked SPEME) to T001W (plant name + BWKEY), MBEW (valuation: VPRSV price control, STPRS/VERPR price, PEINH price unit, BKLAS valuation class), and MARA (MTART material type, MATKL group, MEINS UOM). stock_value = total_qty * unit_price / PEINH where unit_price = STPRS (VPRSV='S') else VERPR. Ordered by stock_value DESC. werks required; matnr_in and lgort optional. Default top_n=100 (widen with top_n). SAP equivalent: MMBE / MB52 / MB5L.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_stock_on_hand - current stock x valuation by material/plant/sloc (MMBE/MB52).\n\nOne row per (MATNR, WERKS, LGORT). Joins MARD (stock quantities) to T001W\n(plant name + BWKEY), MBEW (valuation), and MARA (material type/group).\nValuation = qty * price / PEINH where price is STPRS (VPRSV='S') else VERPR.\n`werks` is required (plant scope). `matnr_in` and `lgort` optionally narrow\nto a subset of materials or a single storage location. Default top_n=100.\n\nAs-at mode (PR2): `as_of_period` (\"YYYY-MM\" = stock at the END of that\nmonth) or `as_of` (ISO date, resolved to the last completed month-end on\nor before it — the result discloses the resolved period). Mutually\nexclusive; both empty = current stock (PR1 path). Month-end is the\ngranularity ceiling; MB5B is the day-level oracle.",
+        "properties": {
+          "top_n": {
+            "default": 0,
+            "title": "Top N",
+            "type": "integer"
+          },
+          "sort_by": {
+            "default": "",
+            "title": "Sort By",
+            "type": "string"
+          },
+          "sort_order": {
+            "default": "desc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "type": "string"
+          },
+          "page_size": {
+            "default": 0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "cursor": {
+            "default": "",
+            "title": "Cursor",
+            "type": "string"
+          },
+          "werks": {
+            "title": "Werks",
+            "type": "string"
+          },
+          "matnr_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Matnr In"
+          },
+          "lgort": {
+            "default": "",
+            "title": "Lgort",
+            "type": "string"
+          },
+          "as_of_period": {
+            "default": "",
+            "title": "As Of Period",
+            "type": "string"
+          },
+          "as_of": {
+            "default": "",
+            "title": "As Of",
+            "type": "string"
+          }
+        },
+        "required": [
+          "werks"
+        ],
+        "title": "StockOnHandArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_inventory_value_summary",
+      "description": "Scalar inventory value per (WERKS, BKLAS valuation class): unrestricted_value, qi_value, blocked_value, total_value (all = qty * price / PEINH), and material_count. Same join as pa_stock_on_hand (MARD + T001W + MBEW + MARA) but aggregated — no row-per-material detail. price = STPRS (VPRSV='S') else VERPR. Currency is per valuation area's local currency (no cross-currency blending; the CC + currency rollup via the granted T001K bridge ships in PR2). werks required; matnr_in optional. SAP equivalent: MB5L / MC.9.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_inventory_value_summary - inventory value per plant/valuation-class (MB5L).\n\nScalar roll-up: one row per (WERKS, BKLAS) — or per (BUKRS, BKLAS) with\n`group_by=\"bukrs\"` (PR2 CC rollup; requires t001w+t001k+t001 staged).\nAggregates MARD quantities x MBEW prices, split by stock bucket, so the\nanalyst sees the monetary inventory breakdown without materialising every\nindividual (MATNR, LGORT) row. `werks` is required. `matnr_in` optionally\nnarrows to a subset of materials.\n\nAs-at mode (PR2): `as_of_period` / `as_of` — same semantics and mutual\nexclusion as StockOnHandArgs; both empty = current values (PR1 path).",
+        "properties": {
+          "werks": {
+            "title": "Werks",
+            "type": "string"
+          },
+          "matnr_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Matnr In"
+          },
+          "as_of_period": {
+            "default": "",
+            "title": "As Of Period",
+            "type": "string"
+          },
+          "as_of": {
+            "default": "",
+            "title": "As Of",
+            "type": "string"
+          },
+          "group_by": {
+            "default": "werks",
+            "title": "Group By",
+            "type": "string"
+          }
+        },
+        "required": [
+          "werks"
+        ],
+        "title": "InventoryValueSummaryArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_asset_register",
+      "description": "Fixed-asset NBV register: one row per asset (ANLN1/ANLN2) with APC, accumulated depreciation and NBV from the LATEST staged ANLC fiscal year, for one depreciation area (afabe, default '01' = book). ANLC stores depreciation NEGATIVE; accum_deprec is reported SIGNED and NBV = (KANSW + ANSWL) + (KNAFA + NAFAG + AAFAG) -- the plain signed sum apc + accum_deprec. Joins ANLA (master, required) + ANLC (year values, required); overlays the ANLZ cost centre/plant/location row valid today, the ANLB depreciation key/useful life interval covering today and ANKT class text (E over D) when staged -- NULL columns otherwise. anlkl (241010 or 00241010) and kostl filters; deactivated assets excluded unless include_deactivated=True. bukrs required. Default top_n=100 (widen with top_n). Returns a table handle. SAP equivalent: AW01N / S_ALR_87011964 / AR01.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_asset_register - per-asset NBV register (AW01N / asset history\nsheet, current fiscal year).\n\nOne row per asset for the chosen depreciation area (`afabe`, default\n'01' = book), NBV computed from the LATEST staged ANLC fiscal year.\n`anlkl` filters by asset class — human ('241010') or padded\n('00241010') form; numeric input is zero-padded to the 8-char wire form\nvia anla.normalise_anlkl. `kostl` filters by the currently-valid ANLZ\ncost centre. Deactivated assets are excluded unless\ninclude_deactivated=True.\n\nBaseListArgs (NOT _StrictBase) deliberately: the shim auto-injects\npage_size/cursor on every list-shaped tool, and extra='forbid' without\nthose fields declared would 422 every call (v0.1.1 lesson).\n\nAs-at mode (PR4): `as_of_period` (\"YYYY-MM\" = NBV at the END of that month,\nintra-year) or `as_of` (ISO date -> its calendar month-end). Mutually\nexclusive; both empty = current latest-staged-year register (PR3 path).\nAPC is exact (ANEP cumulative through the period); accumulated depreciation\nis interpolated from the posted annual (ANLC.NAFAG x P/N).",
+        "properties": {
+          "top_n": {
+            "default": 0,
+            "title": "Top N",
+            "type": "integer"
+          },
+          "sort_by": {
+            "default": "",
+            "title": "Sort By",
+            "type": "string"
+          },
+          "sort_order": {
+            "default": "desc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "type": "string"
+          },
+          "page_size": {
+            "default": 0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "cursor": {
+            "default": "",
+            "title": "Cursor",
+            "type": "string"
+          },
+          "bukrs": {
+            "title": "Bukrs",
+            "type": "string"
+          },
+          "anlkl": {
+            "default": "",
+            "title": "Anlkl",
+            "type": "string"
+          },
+          "kostl": {
+            "default": "",
+            "title": "Kostl",
+            "type": "string"
+          },
+          "afabe": {
+            "default": "01",
+            "title": "Afabe",
+            "type": "string"
+          },
+          "include_deactivated": {
+            "default": false,
+            "title": "Include Deactivated",
+            "type": "boolean"
+          },
+          "as_of_period": {
+            "default": "",
+            "title": "As Of Period",
+            "type": "string"
+          },
+          "as_of": {
+            "default": "",
+            "title": "As Of",
+            "type": "string"
+          }
+        },
+        "required": [
+          "bukrs"
+        ],
+        "title": "AssetRegisterArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_asset_value_summary",
+      "description": "Scalar fixed-asset rollup per asset class (group_by='anlkl', default; with ANKT class text) or per current cost centre (group_by='kostl'; needs anlz staged): asset_count, apc, accum_deprec (reported SIGNED -- negative) and nbv (= apc + accum_deprec, the plain signed sum; exact cross-foot over per-asset rounded values) from the LATEST staged ANLC fiscal year, for one depreciation area (afabe, default '01' = book). Deactivated assets always excluded. bukrs required. Same staging as pa_asset_register (anla + anlc). SAP equivalent: S_ALR_87011964 / AW01N.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_asset_value_summary - APC / accumulated-depreciation / NBV rollup\nper asset class (default) or cost centre. Scalar mirror of\npa_asset_register over the same latest-staged-ANLC-year read; deactivated\nassets are always excluded (no toggle on the summary).\n\nAs-at mode (PR4): `as_of_period` / `as_of` — same intra-year semantics and\nmutual exclusion as AssetRegisterArgs; both empty = current latest-staged-\nyear rollup (PR3 path).",
+        "properties": {
+          "bukrs": {
+            "title": "Bukrs",
+            "type": "string"
+          },
+          "afabe": {
+            "default": "01",
+            "title": "Afabe",
+            "type": "string"
+          },
+          "group_by": {
+            "default": "anlkl",
+            "title": "Group By",
+            "type": "string"
+          },
+          "as_of_period": {
+            "default": "",
+            "title": "As Of Period",
+            "type": "string"
+          },
+          "as_of": {
+            "default": "",
+            "title": "As Of",
+            "type": "string"
+          }
+        },
+        "required": [
+          "bukrs"
+        ],
+        "title": "AssetValueSummaryArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_asset_transactions",
+      "description": "Asset transaction lines (ANEP): one row per posting line for one depreciation area (afabe, default '01' = book) -- acquisitions, retirements, transfers and write-ups. Each row carries the asset (anln1/anln2), class (+ ANKT text when staged), period (peraf), value date (bzdat), the raw transaction type (txn_type = BWASL), a HEURISTIC category (acquisition/retirement/transfer/other from the BWASL leading digit -- TABWG not granted, so txn_type is exposed for verification), the SIGNED amount (anbtr -- acquisitions +, retirements -; never absolute) and the document (belnr/buzei). Joins ANLA (master, required) + ANEP (lines, required). Optional gjahr / anlkl (241010 or 00241010) / category filters. bukrs required. Default top_n=100 (widen with top_n). Returns a table handle. SAP equivalent: AR02 / S_ALR_87012050 (acquisitions) / S_ALR_87012052 (retirements). Asset transaction lines from ANEP.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_asset_transactions — ANEP asset transaction lines (acquisitions /\nretirements / transfers). bukrs required; optional fiscal-year + class +\ncategory filters; afabe selects the depreciation area view.\n\n`category` filters on a HEURISTIC label derived from the BWASL leading\ndigit (acquisition / retirement / transfer / other) — validated in the\nanalytical, like group_by, not at parse time. \"\" = all transaction types.",
+        "properties": {
+          "top_n": {
+            "default": 0,
+            "title": "Top N",
+            "type": "integer"
+          },
+          "sort_by": {
+            "default": "",
+            "title": "Sort By",
+            "type": "string"
+          },
+          "sort_order": {
+            "default": "desc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "type": "string"
+          },
+          "page_size": {
+            "default": 0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "cursor": {
+            "default": "",
+            "title": "Cursor",
+            "type": "string"
+          },
+          "bukrs": {
+            "title": "Bukrs",
+            "type": "string"
+          },
+          "gjahr": {
+            "default": "",
+            "title": "Gjahr",
+            "type": "string"
+          },
+          "anlkl": {
+            "default": "",
+            "title": "Anlkl",
+            "type": "string"
+          },
+          "afabe": {
+            "default": "01",
+            "title": "Afabe",
+            "type": "string"
+          },
+          "category": {
+            "default": "",
+            "title": "Category",
+            "type": "string"
+          }
+        },
+        "required": [
+          "bukrs"
+        ],
+        "title": "AssetTransactionsArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_material_movements",
+      "description": "Material document movement list (MB51): one row per MSEG line (MBLNR/MJAHR/ZEILE) for a plant. menge_signed / dmbtr_signed apply the SHKZG sign convention -- goods ISSUES (SHKZG='H') are shown NEGATIVE, receipts/reversals (SHKZG='S') POSITIVE, so the signed sum over a window is the net stock movement. Each row carries budat (BUDAT_MKPF), bwart + movement_text (T156T, English over German -- NULL when t156t unstaged), matnr/werks/lgort/charg, meins, waers, grund, sgtxt, aufnr, plus the MKPF header overlay (blart/usnam/xblnr -- NULL when mkpf unstaged). MSEG required; T156T + MKPF are optional detect-and-degrade overlays. Optional matnr / bwart exact filters and a budat_from/budat_to window. werks required. Default top_n=100 (widen with top_n). Returns a table handle. SAP equivalent: MB51 / MB03.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_material_movements — MB51. MSEG document lines filtered by plant /\nmaterial / movement-type / posting-date window.\n\n`werks` is required (the plant-ACL arg, gated at the analytical like the\nstock family). `matnr` / `bwart` optionally narrow to an exact material /\nmovement type; `budat_from` / `budat_to` bound the posting-date window on\nBUDAT_MKPF (ISO YYYY-MM-DD).\n\nBaseListArgs (NOT _StrictBase) deliberately: the shim auto-injects\npage_size/cursor on every list-shaped tool, and extra='forbid' without\nthose fields declared would 422 every call (v0.1.1 lesson).",
+        "properties": {
+          "top_n": {
+            "default": 0,
+            "title": "Top N",
+            "type": "integer"
+          },
+          "sort_by": {
+            "default": "",
+            "title": "Sort By",
+            "type": "string"
+          },
+          "sort_order": {
+            "default": "desc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "type": "string"
+          },
+          "page_size": {
+            "default": 0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "cursor": {
+            "default": "",
+            "title": "Cursor",
+            "type": "string"
+          },
+          "werks": {
+            "title": "Werks",
+            "type": "string"
+          },
+          "matnr": {
+            "default": "",
+            "title": "Matnr",
+            "type": "string"
+          },
+          "bwart": {
+            "default": "",
+            "title": "Bwart",
+            "type": "string"
+          },
+          "budat_from": {
+            "default": "",
+            "title": "Budat From",
+            "type": "string"
+          },
+          "budat_to": {
+            "default": "",
+            "title": "Budat To",
+            "type": "string"
+          }
+        },
+        "required": [
+          "werks"
+        ],
+        "title": "MaterialMovementsArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_scrap_analysis",
+      "description": "Net scrap by the STANDARD SAP scrapping movement types: MSEG filtered to {551,552,553,554,555,556}, net per group = Σ(issues 551/553/555) − Σ(reversals 552/554/556) on quantity (net_scrap_qty, MENGE) and value (net_scrap_value, DMBTR), plus scrap_line_count. Scrap is defined by BWART (every SOBKZ variant included); all NON-scrap movements (101 GR, 261 GI to order, ...) are excluded. group_by ∈ {matnr, werks, grund, period} (period = YYYY-MM on BUDAT_MKPF; validated -> ValueError). Optional matnr + budat window. mseg required (+ the plant row-guard). werks required. Returns a table handle. SAP equivalent: MB51 (scrapping movement types) / MCBA scrap.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_scrap_analysis — net scrap (standard SAP scrapping movement types)\nby material / plant / reason / period.\n\n`werks` is required (plant ACL). `matnr` optionally narrows to one\nmaterial; `budat_from` / `budat_to` bound the posting-date window\n(ISO YYYY-MM-DD). `group_by` ∈ {matnr, werks, grund, period}\n(period = YYYY-MM on BUDAT_MKPF) — validated in the analytical, like the\nasset summary group_by, not at parse time.",
+        "properties": {
+          "top_n": {
+            "default": 0,
+            "title": "Top N",
+            "type": "integer"
+          },
+          "sort_by": {
+            "default": "",
+            "title": "Sort By",
+            "type": "string"
+          },
+          "sort_order": {
+            "default": "desc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "type": "string"
+          },
+          "page_size": {
+            "default": 0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "cursor": {
+            "default": "",
+            "title": "Cursor",
+            "type": "string"
+          },
+          "werks": {
+            "title": "Werks",
+            "type": "string"
+          },
+          "matnr": {
+            "default": "",
+            "title": "Matnr",
+            "type": "string"
+          },
+          "budat_from": {
+            "default": "",
+            "title": "Budat From",
+            "type": "string"
+          },
+          "budat_to": {
+            "default": "",
+            "title": "Budat To",
+            "type": "string"
+          },
+          "group_by": {
+            "default": "matnr",
+            "title": "Group By",
+            "type": "string"
+          }
+        },
+        "required": [
+          "werks"
+        ],
+        "title": "ScrapAnalysisArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_dead_stock",
+      "description": "Dead / slow-moving stock (MC50 / MB5M): materials holding stock VALUE (MBEW SALK3) with no / old goods movement (MSEG MAX BUDAT_MKPF). One row per (MATNR, BWKEY). Join: mbew.matnr/bwkey = mseg.matnr/werks (BWKEY=WERKS at Punch). val SUMs SALK3/LBKUM per (matnr, bwkey) so a split-valuated material collapses to one row (no BWTAR fan-out). The staged MSEG window IS the recency lookback -- a material absent from it has not moved within the window; days_since_movement for such a material is a LOWER BOUND from movement_window_start (both window bounds surfaced). moved_in_window flags whether the material moved in the staged window. Filters: min_value (SALK3 floor), min_days_idle (days since last movement), as_of ('' = current_date). MBEW + MSEG required (the window is load-bearing); MARA optional (mtart/matkl overlay, detect-and-degrade). werks required (plant ACL). Default top_n=100 (widen with top_n). Returns a table handle. SAP equivalent: MC50 / MB5M (slow-moving / dead-stock list).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_dead_stock — dead / slow-moving stock (MC50 / MB5M). Materials\nholding stock VALUE (MBEW SALK3) with no / old goods movement (MSEG\nMAX BUDAT_MKPF).\n\n`werks` is required (the plant-ACL arg, gated at the analytical like the\nstock family — BWKEY=WERKS at Punch, so it scopes both MBEW (BWKEY) and\nMSEG (WERKS)). `min_value` (SALK3 floor, default 0 => any material with\nSALK3>0) and `min_days_idle` (filter on days since last movement, default\n0) narrow the result. `as_of` (ISO YYYY-MM-DD; \"\" = current_date) is the\nreference date the idle-days are measured FROM.\n\nThe staged MSEG window IS the recency lookback: a material absent from it\nhas not moved within the window, and the analytical discloses the window's\ndate range (movement_window_start / _end) so the \"deadness\" is\ninterpretable. No-movement idle is a LOWER BOUND of (as_of - window_start).\n\nBaseListArgs (NOT _StrictBase) deliberately: the shim auto-injects\npage_size/cursor on every list-shaped tool, and extra='forbid' without\nthose fields declared would 422 every call (v0.1.1 lesson).",
+        "properties": {
+          "top_n": {
+            "default": 0,
+            "title": "Top N",
+            "type": "integer"
+          },
+          "sort_by": {
+            "default": "",
+            "title": "Sort By",
+            "type": "string"
+          },
+          "sort_order": {
+            "default": "desc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "type": "string"
+          },
+          "page_size": {
+            "default": 0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "cursor": {
+            "default": "",
+            "title": "Cursor",
+            "type": "string"
+          },
+          "werks": {
+            "title": "Werks",
+            "type": "string"
+          },
+          "min_value": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Min Value",
+            "type": "number"
+          },
+          "min_days_idle": {
+            "default": 0,
+            "minimum": 0,
+            "title": "Min Days Idle",
+            "type": "integer"
+          },
+          "as_of": {
+            "default": "",
+            "title": "As Of",
+            "type": "string"
+          }
+        },
+        "required": [
+          "werks"
+        ],
+        "title": "DeadStockArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_project_profitability",
+      "description": "Project / WBS profitability (revenue / cost / net) from CO actual postings. Answers 'what's the profitability of the DT2C MSIL project?'. Project resolution is SPACE- and CASE-tolerant: 'DT2CMSIL' (no space) and 'dt2c msil' both resolve to 'DT2C MSIL' (Punch project codes are full of embedded spaces). Rolls up the project's WBS objects (PRPS.OBJNR where PSPHI = the project) and sums COEP WRTTP='04' actuals classified by cost-element category CSKB.KATYP (11/12 = revenue, else cost) -- NOT a debit/credit guess. SIGNED NETTING (not abs): revenue = -SUM(WKGBTR) over the revenue elements (revenue posts as a credit, negated to a positive figure); cost = SUM(WKGBTR) over the rest, where credits -- reinvoices / internal allocations / reversals -- net against debits; net = revenue - cost = -SUM(WKGBTR), reconciling to SAP CJI3 / S_ALR_87013542 'All Cost Elements / Actual'; CO-area currency (WKGBTR). Returns the scalar figures (revenue/cost/net/line_count, year range) + by-year and a per-WBS detail handle. CSKB unstaged -> all-cost degrade (disclosed). A no-match / ambiguous project returns found=False with guidance (not a crash). proj + prps + coep required (coep must hold the project's OBJNRs, else a missing_extract with the exact objnr_in hint). SAP equivalent: CJI3 / S_ALR_87013542 (project P&L).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_project_profitability — revenue / cost / net for a SAP project from\nCO actual postings (SAP equivalent: CJI3 / S_ALR_87013542 project P&L).\n\n`project` is REQUIRED — the project code (PROJ.PSPID). Resolution is\nSPACE- and CASE-tolerant: Punch project codes are full of embedded spaces\n(`DT2C MSIL`, `HIMALAYA MK2`), and a user typically types the spaceless\nform (`DT2CMSIL`), so both sides are normalised (strip spaces + upper-case)\nbefore matching. `gjahr_from` (\"YYYY\"; \"\" = all years) bounds the year\nbreakdown; `kokrs` (controlling area, default '1000') scopes the COEP /\nCSKB read.\n\nBaseListArgs (NOT _StrictBase) deliberately: the shim auto-injects\npage_size/cursor on every list-shaped tool, and extra='forbid' without\nthose fields declared would 422 every call (v0.1.1 lesson).",
+        "properties": {
+          "top_n": {
+            "default": 0,
+            "title": "Top N",
+            "type": "integer"
+          },
+          "sort_by": {
+            "default": "",
+            "title": "Sort By",
+            "type": "string"
+          },
+          "sort_order": {
+            "default": "desc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "type": "string"
+          },
+          "page_size": {
+            "default": 0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "cursor": {
+            "default": "",
+            "title": "Cursor",
+            "type": "string"
+          },
+          "project": {
+            "title": "Project",
+            "type": "string"
+          },
+          "gjahr_from": {
+            "default": "",
+            "title": "Gjahr From",
+            "type": "string"
+          },
+          "kokrs": {
+            "default": "1000",
+            "title": "Kokrs",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project"
+        ],
+        "title": "ProjectProfitabilityArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_project_list",
+      "description": "List projects with their current / closed / created status (answers 'what projects are current in WBS?'). Status comes from the project-definition object's JEST system statuses (PROJ.OBJNR = 'PD'||PSPNR): current = REL (I0002) active and NOT TECO (I0045) / CLSD (I0046) / DLFL (I0076) active and PROJ.LOEVM blank; closed = CLSD or TECO; created = CRTD (I0001) and not REL. status arg = current (default) | all | closed | created. bukrs filters PROJ.VBUKR; name_contains is a case-insensitive POST1/PSPID filter. Columns: pspid, project_name, status_label, wbs_count, vbukr, werks. proj required; JEST detect-and-degrade (unstaged -> status 'unknown', not silently current); prps optional (wbs_count NULL when unstaged). SAP equivalent: CN41 / CN43 (project info system) / CJ20N.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_project_list — list projects with their current/closed/created status\n(SAP equivalent: CN41 / CN43 project info system / CJ20N). One row per\nPROJ project; status comes from the project-definition object's JEST system\nstatuses (PROJ.OBJNR = 'PD'||PSPNR).\n\n`bukrs` filters PROJ.VBUKR (\"\" = all staged projects). `status` selects\nwhich projects to return — current (default) | all | closed | created\n(validated in the analytical, not at parse time, like the asset-summary\ngroup_by). `name_contains` is a case-insensitive substring filter on the\nproject name (POST1) or code (PSPID).\n\n\"Current\" = the PD-object has REL (system status I0002) active AND NOT\nTECO (I0045) / CLSD (I0046) / DLFL (I0076) active, AND PROJ.LOEVM\n(deletion) blank. JEST is required for a real status; if it is not staged\nthe analytical degrades to status_label='unknown' for every non-deleted\nproject (loud note) rather than silently calling everything current.\n\nBaseListArgs (NOT _StrictBase) deliberately: the shim auto-injects\npage_size/cursor on every list-shaped tool, and extra='forbid' without\nthose fields declared would 422 every call (v0.1.1 lesson).",
+        "properties": {
+          "top_n": {
+            "default": 0,
+            "title": "Top N",
+            "type": "integer"
+          },
+          "sort_by": {
+            "default": "",
+            "title": "Sort By",
+            "type": "string"
+          },
+          "sort_order": {
+            "default": "desc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "type": "string"
+          },
+          "page_size": {
+            "default": 0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "cursor": {
+            "default": "",
+            "title": "Cursor",
+            "type": "string"
+          },
+          "bukrs": {
+            "default": "",
+            "title": "Bukrs",
+            "type": "string"
+          },
+          "status": {
+            "default": "current",
+            "title": "Status",
+            "type": "string"
+          },
+          "name_contains": {
+            "default": "",
+            "title": "Name Contains",
+            "type": "string"
+          }
+        },
+        "title": "ProjectListArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_vendor_open_items",
+      "description": "Open vendor (AP) items keyed by LIFNR, aged from the net due date (CC-14: ZFBDT + payment terms), with payment-block (zlspr) + dunning level (manst) and vendor name overlay. as_of set => open AT that key date = BSIK(BUDAT<=D) UNION ALL BSAK(BUDAT<=D AND AUGDT>D); requires pa_extract_bsak staged (else missing_extract). Signed, NO negation (AP invoices land negative). Table handle; default top_n=100 (widen with top_n). SAP equivalent: FBL1N.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_vendor_open_items — FBL1N: open vendor (AP) items keyed by LIFNR, aged\nfrom the net due date (CC-14). Row-shaped (TableHandleResult).\n\n`as_of` \"\" => currently open (BSIK only). When set => open AT that key date\n= BSIK(BUDAT<=D) UNION ALL BSAK(BUDAT<=D AND AUGDT>D); requires BSAK staged\nfor the same bukrs (else a missing_extract naming pa_extract_bsak — never a\nsilent open-leg-only answer that understates the as-at position).\n\n`lifnr_in` accepts the human (200001) or padded (0000200001) form; numeric\nvalues are zero-padded to CHAR(10) before the query. Omit for all open AP\nitems in the CC.",
+        "properties": {
+          "top_n": {
+            "default": 0,
+            "title": "Top N",
+            "type": "integer"
+          },
+          "sort_by": {
+            "default": "",
+            "title": "Sort By",
+            "type": "string"
+          },
+          "sort_order": {
+            "default": "desc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "type": "string"
+          },
+          "page_size": {
+            "default": 0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "cursor": {
+            "default": "",
+            "title": "Cursor",
+            "type": "string"
+          },
+          "bukrs": {
+            "title": "Bukrs",
+            "type": "string"
+          },
+          "lifnr_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Lifnr In"
+          },
+          "as_of": {
+            "default": "",
+            "title": "As Of",
+            "type": "string"
+          }
+        },
+        "required": [
+          "bukrs"
+        ],
+        "title": "VendorOpenItemsArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_customer_open_items",
+      "description": "Open customer (AR) items keyed by KUNNR, aged from the net due date (CC-14), with payment-block + dunning and customer name overlay. AR mirror of pa_vendor_open_items on BSID/BSAD. as_of set => BSID(BUDAT<=D) UNION ALL BSAD(BUDAT<=D AND AUGDT>D); requires pa_extract_bsad staged. Table handle; default top_n=100. SAP equivalent: FBL5N.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_customer_open_items — FBL5N: the AR mirror of VendorOpenItemsArgs on\nBSID / BSAD / KUNNR. `as_of` set => BSID(BUDAT<=D) UNION ALL\nBSAD(BUDAT<=D AND AUGDT>D), requires BSAD staged. `kunnr_in` zero-padded\nlike lifnr_in.",
+        "properties": {
+          "top_n": {
+            "default": 0,
+            "title": "Top N",
+            "type": "integer"
+          },
+          "sort_by": {
+            "default": "",
+            "title": "Sort By",
+            "type": "string"
+          },
+          "sort_order": {
+            "default": "desc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "type": "string"
+          },
+          "page_size": {
+            "default": 0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "cursor": {
+            "default": "",
+            "title": "Cursor",
+            "type": "string"
+          },
+          "bukrs": {
+            "title": "Bukrs",
+            "type": "string"
+          },
+          "kunnr_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Kunnr In"
+          },
+          "as_of": {
+            "default": "",
+            "title": "As Of",
+            "type": "string"
+          }
+        },
+        "required": [
+          "bukrs"
+        ],
+        "title": "CustomerOpenItemsArgs",
         "type": "object"
       }
     },
@@ -6029,6 +7774,67 @@
           }
         },
         "title": "CompanyCodesArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_plants",
+      "description": "List staged plants (T001W): werks, name, valuation area; + company code (T001K) and CC name/currency (T001) when staged. Answers 'what plants exist / which plants belong to CC 8000'. SAP equivalent: OX10 / T001W view.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_plants — list-shaped read of the staged T001W plant master (the\nplant-discovery reader, defect P2.2). One row per plant: werks, name1,\nbwkey, plus the company-code bridge as detect-and-degrade enrichment\n(bukrs via T001K; butxt/waers via T001 — NULL when not staged). `bukrs`\nfilters to one company code's plants (requires t001k staged; clear\nerror otherwise). werks_in[] narrows to specific plants (StrList\naccepts CSV strings too). Sort by werks / name1 / bwkey; werks ASC by\ndefault (a discovery list reads in natural code order).",
+        "properties": {
+          "top_n": {
+            "default": 0,
+            "title": "Top N",
+            "type": "integer"
+          },
+          "sort_by": {
+            "default": "",
+            "title": "Sort By",
+            "type": "string"
+          },
+          "sort_order": {
+            "default": "asc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "type": "string"
+          },
+          "page_size": {
+            "default": 0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "cursor": {
+            "default": "",
+            "title": "Cursor",
+            "type": "string"
+          },
+          "bukrs": {
+            "default": "",
+            "title": "Bukrs",
+            "type": "string"
+          },
+          "werks_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Werks In"
+          }
+        },
+        "title": "PlantsArgs",
         "type": "object"
       }
     },
@@ -6556,6 +8362,17 @@
         "description": "pa_whoami — no inputs. Reports the calling account's own access.",
         "properties": {},
         "title": "WhoamiArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_nightly_review_latest",
+      "description": "Return the latest nightly self-review as markdown — the daily MCP-usage analysis, proposed improvements, and skill-maintenance outcome — for formatting into a digest email.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_nightly_review_latest — no inputs. Returns the latest nightly review.",
+        "properties": {},
+        "title": "NightlyReviewLatestArgs",
         "type": "object"
       }
     },
@@ -7598,7 +9415,7 @@
       }
     }
   ],
-  "count": 175,
-  "server_version": "0.1.22",
-  "generated_from": "pa_v2 dispatcher.list_tools_for_user(full_access=False) — offline-fallback snapshot @ v0.1.22"
+  "count": 217,
+  "server_version": "0.1.44",
+  "generated_from": "pa_v2 dispatcher.list_tools_for_user(full_access=False) — offline-fallback snapshot @ v0.1.44"
 }
