@@ -99,7 +99,9 @@ if($shimAlreadyInstalled){
   try { $existing = Get-Content -Raw -LiteralPath $backendsFile | ConvertFrom-Json } catch { $existing = $null }
 }
 
-# Two backends today: SAP analytics on :3000 and Zabbix adapter on :3002.
+# Four backends today: SAP (:3000), Zabbix (:3002), R&D MCP (:3010), Tutorials
+# recommender (:3015). rd + tutorials are also auto-discovered from the
+# supervisor; seeded here so fresh installs have them without waiting on discovery.
 # Both go through the same hostname; both use Kerberos. No header/key
 # fields -- those are explicitly absent for negotiate-mode backends, and
 # the v2.4+ shim sends Authorization: Negotiate built from the user's
@@ -114,8 +116,10 @@ function NewEntry($name, $port){
 
 $serverHostUrl = $ServerUrl -replace ':\d+$', ''   # strip the trailing port
 $desired = @{
-  'sap'    = (NewEntry 'sap'    3000)
-  'zabbix' = (NewEntry 'zabbix' 3002)
+  'sap'       = (NewEntry 'sap'       3000)
+  'zabbix'    = (NewEntry 'zabbix'    3002)
+  'rd'        = (NewEntry 'rd'        3010)
+  'tutorials' = (NewEntry 'tutorials' 3015)
 }
 
 $merged = [ordered]@{}
@@ -144,7 +148,7 @@ $config = [ordered]@{
 $tmp = "$backendsFile.tmp"
 $config | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $tmp -Encoding UTF8
 Move-Item -Force -LiteralPath $tmp -Destination $backendsFile
-OK "backends.json written ($($merged.Count) backend(s); sap + zabbix on Kerberos)"
+OK "backends.json written ($($merged.Count) backend(s); sap + zabbix + rd + tutorials on Kerberos)"
 
 # ----------------------------------------------------------------------------
 # 4. Install the MCPB extension if absent
