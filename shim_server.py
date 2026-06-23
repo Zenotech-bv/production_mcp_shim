@@ -179,7 +179,21 @@ from mcp.server.fastmcp import Context, FastMCP
 # current MCPB key `manifest_version: "0.3"` instead of `dxt_version: "0.1"`,
 # which every build had silently inherited from the 2.4.1 baseline. No shim
 # logic change.
-_SHIM_VERSION = "3.4.5"
+# v3.4.6 — manifest self-heal (delivers the v3.4.3 fix to already-installed
+# laptops). The v3.4.3 persistent-uv-env fix lives entirely in the packaged
+# manifest.json (server.mcp_config.env -> UV_* under ${HOME}/.punch-shim/*,
+# injected by build-mcpb.ps1). But _maybe_self_update only ever rewrites THIS
+# file (shim_server.py); it never touches manifest.json. So a laptop that
+# auto-updated the shim source past v3.4.3 kept its pre-fix packaged manifest
+# and still paid the cold `uv run` re-provision (download CPython + ~33 wheels,
+# minutes on a corporate network) on EVERY launch. _heal_manifest_uv_env closes
+# that distribution gap through the one artifact that does reach laptops hands-
+# off (this file): on startup it injects the UV_* keys into the packaged
+# manifest if they're absent. The client re-reads the manifest on its next
+# launch, so the env converges with no per-laptop action. Best-effort +
+# idempotent; never blocks startup. Logic change, but no behaviour change for
+# an already-fixed (v3.4.3+) manifest — it's a no-op there.
+_SHIM_VERSION = "3.4.6"
 
 
 # ---------------------------------------------------------------------------
@@ -1359,7 +1373,89 @@ def _maybe_self_update() -> None:
                    error=f"{type(e).__name__}: {e}")
 
 
+# ---------------------------------------------------------------------------
+# v3.4.6 — manifest self-heal (see the version comment near _SHIM_VERSION).
+# Carries the v3.4.3 persistent-uv-env fix to laptops that auto-updated
+# shim_server.py but kept a pre-fix packaged manifest.
+# ---------------------------------------------------------------------------
+
+# The exact keys + literal ${HOME} values build-mcpb.ps1 writes, so a healed
+# manifest is byte-for-byte what a fresh build would have produced. Claude
+# Desktop expands ${HOME} when it reads the manifest env at launch.
+_UV_PERSIST_ENV = {
+    "UV_PROJECT_ENVIRONMENT": "${HOME}/.punch-shim/venv",
+    "UV_CACHE_DIR":           "${HOME}/.punch-shim/uv-cache",
+    "UV_PYTHON_INSTALL_DIR":  "${HOME}/.punch-shim/uv-python",
+}
+
+
+def _packaged_manifest_path() -> Path:
+    """Path to the .mcpb-packaged manifest.json — the extension root, one
+    level up from this server/ dir. This is NOT the source repo's
+    update-descriptor manifest.json (version/sha256/source_url) that sits
+    beside shim_server.py; _heal_manifest_uv_env's shape guard refuses to
+    touch that one."""
+    return Path(__file__).resolve().parent.parent / "manifest.json"
+
+
+def _heal_manifest_uv_env(manifest_path: Path) -> bool:
+    """Ensure the packaged manifest's server.mcp_config.env carries the
+    UV_* persistence keys (the v3.4.3 fix). Returns True iff the file was
+    modified.
+
+    Idempotent: a no-op once all three keys are present, so steady-state
+    launches never rewrite the file. Best-effort: any missing-file,
+    wrong-shape, unreadable, or unwritable condition returns False without
+    raising — startup must never depend on this succeeding.
+
+    Shape guard: only a .mcpb-packaged manifest has server.mcp_config. The
+    source repo's update-descriptor manifest.json does not, so a dev/test
+    import that happens to resolve to it is left untouched.
+    """
+    try:
+        if not manifest_path.exists():
+            return False
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    server = data.get("server")
+    if not isinstance(server, dict):
+        return False
+    mcp_config = server.get("mcp_config")
+    if not isinstance(mcp_config, dict):
+        return False
+    env = mcp_config.get("env")
+    if not isinstance(env, dict):
+        env = {}
+    missing = {k: v for k, v in _UV_PERSIST_ENV.items() if k not in env}
+    if not missing:
+        return False
+    env.update(missing)
+    mcp_config["env"] = env
+    try:
+        backup = manifest_path.with_suffix(manifest_path.suffix + ".prepatch.bak")
+        if not backup.exists():
+            shutil.copy2(manifest_path, backup)
+        manifest_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError as e:
+        _log_event("manifest_uv_env_heal_failed", level=logging.WARNING,
+                   path=str(manifest_path), error=f"{type(e).__name__}: {e}")
+        return False
+    _log_event(
+        "manifest_uv_env_healed",
+        path=str(manifest_path),
+        injected=sorted(missing.keys()),
+        note=("packaged manifest lacked the v3.4.3 persistent-uv-env keys; "
+              "injected so the next client launch reuses ~/.punch-shim instead "
+              "of re-provisioning the uv env from cold each start"),
+    )
+    return True
+
+
 _maybe_self_update()
+_heal_manifest_uv_env(_packaged_manifest_path())
 
 
 # ---------------------------------------------------------------------------
