@@ -567,8 +567,110 @@ def _refresh_token(refresh_token: str) -> dict:
     return r.json()
 
 
+def _oidc_cache_dir():
+    d = _resolve_log_dir() / "oidc"   # %LOCALAPPDATA%\PunchAnalytics\oidc (test-isolated)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _oidc_cache_path(upn: str):
+    import hashlib  # lazy
+    tag = hashlib.sha256(upn.lower().encode("utf-8")).hexdigest()[:16]
+    return _oidc_cache_dir() / f"tok_{tag}.bin"
+
+
+def _dpapi_available() -> bool:
+    try:
+        import win32crypt  # noqa: F401  (lazy)
+        return True
+    except Exception:
+        return False
+
+
+def _dpapi_protect(raw: bytes) -> bytes:
+    import win32crypt  # lazy
+    # user-scoped DPAPI (no LOCALMACHINE flag): file-copy/backup theft yields ciphertext.
+    return win32crypt.CryptProtectData(raw, "punch-oidc", None, None, None, 0)
+
+
+def _dpapi_unprotect(blob: bytes) -> bytes:
+    import win32crypt  # lazy
+    _desc, out = win32crypt.CryptUnprotectData(blob, None, None, None, 0)
+    return out
+
+
+def _token_cache_write(upn: str, tokens: dict) -> None:
+    import json, base64  # lazy for json? json is stdlib+cheap; keep base64 lazy
+    payload = json.dumps(tokens).encode("utf-8")
+    path = _oidc_cache_path(upn)
+    try:
+        if _dpapi_available():
+            path.write_bytes(_dpapi_protect(payload))
+        else:
+            # plaintext fallback — still per-Windows-user isolated under LOCALAPPDATA.
+            path.write_bytes(b"PLAIN:" + base64.b64encode(payload))
+        try:
+            import os as _os
+            _os.chmod(path, 0o600)   # best-effort owner-only
+        except OSError:
+            pass
+    except OSError as e:
+        _log_event("oidc_cache_write_failed", level=logging.WARNING, error=str(e))
+
+
+def _token_cache_read(upn: str) -> dict | None:
+    import json, base64  # lazy
+    path = _oidc_cache_path(upn)
+    try:
+        blob = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        if blob.startswith(b"PLAIN:"):
+            raw = base64.b64decode(blob[len(b"PLAIN:"):])
+        else:
+            raw = _dpapi_unprotect(blob)
+        return json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        _log_event("oidc_cache_read_failed", level=logging.WARNING, error=str(e))
+        return None
+
+
 def _oidc_acquire_token(upn: str, *, allow_interactive: bool) -> str:
-    raise NotImplementedError("implemented in Slice B Task 3")
+    import time as _t, secrets  # lazy
+    cached = _token_cache_read(upn)
+    if cached:
+        if cached.get("access_token") and float(cached.get("expires_at", 0)) - 60 > _t.time():
+            return cached["access_token"]
+        if cached.get("refresh_token"):
+            try:
+                toks = _refresh_token(cached["refresh_token"])
+                _persist_tokens(upn, toks)
+                return toks["access_token"]
+            except OidcError as e:
+                _log_event("oidc_refresh_failed", level=logging.WARNING, error=str(e))
+                # fall through to interactive (if allowed)
+    if not allow_interactive:
+        raise OidcError("no usable OIDC token and interactive sign-in not allowed here")
+    state = secrets.token_urlsafe(24)
+    code, redirect_uri, verifier = _loopback_receive_code(
+        state=state, timeout=_OIDC_INTERACTIVE_TIMEOUT, login_hint=upn)
+    toks = _exchange_code(code, verifier, redirect_uri)
+    _persist_tokens(upn, toks)
+    return toks["access_token"]
+
+
+def _persist_tokens(upn: str, toks: dict) -> None:
+    import time as _t  # lazy
+    rec = {
+        "access_token": toks.get("access_token"),
+        "refresh_token": toks.get("refresh_token"),
+        "expires_at": _t.time() + int(toks.get("expires_in", 3600)),
+    }
+    _token_cache_write(upn, rec)
 
 
 class OidcAuth(httpx.Auth):
