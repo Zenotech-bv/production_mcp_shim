@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -85,6 +85,31 @@ def test_loopback_rejects_state_mismatch():
                       return_value={"code": "C", "state": "WRONG"}):
         with pytest.raises(shim.OidcError, match="state"):
             shim._loopback_receive_code(state="EXPECTED", timeout=1.0)
+
+
+def test_verify_id_token_nonce_mismatch_raises():
+    """Fix 1: an id_token whose nonce claim doesn't match the one sent in the
+    authorize request must be rejected (token-replay/injection defense)."""
+    import jwt
+    shim = _shim()
+    bad_id_token = jwt.encode({"nonce": "WRONG"}, "k", algorithm="HS256")
+    with pytest.raises(shim.OidcError):
+        shim._verify_id_token_nonce({"id_token": bad_id_token}, "EXPECTED")
+
+
+def test_verify_id_token_nonce_match_ok():
+    """A matching nonce claim must NOT raise."""
+    import jwt
+    shim = _shim()
+    good_id_token = jwt.encode({"nonce": "EXPECTED"}, "k", algorithm="HS256")
+    shim._verify_id_token_nonce({"id_token": good_id_token}, "EXPECTED")  # no raise
+
+
+def test_verify_id_token_nonce_absent_id_token_skips():
+    """No id_token in the token response (scope doesn't guarantee one) must
+    be a silent skip, not a failure."""
+    shim = _shim()
+    shim._verify_id_token_nonce({}, "EXPECTED")  # no raise
 
 
 def test_refresh_token_posts_refresh_grant():

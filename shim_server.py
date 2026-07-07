@@ -490,10 +490,10 @@ def _loopback_serve_once(port_holder: dict, timeout: float) -> dict:
     return result
 
 
-def _loopback_receive_code(*, state: str, timeout: float, login_hint: str = "") -> tuple[str, str, str]:
+def _loopback_receive_code(*, state: str, timeout: float, login_hint: str = "") -> tuple[str, str, str, str]:
     """Open the browser to the authorize URL and receive the code on a loopback
-    listener. Returns (code, redirect_uri, code_verifier). Raises OidcError on
-    timeout / user cancel / state mismatch. Binds 127.0.0.1 on an ephemeral port
+    listener. Returns (code, redirect_uri, code_verifier, nonce). Raises OidcError
+    on timeout / user cancel / state mismatch. Binds 127.0.0.1 on an ephemeral port
     (via _loopback_serve_once, in a daemon thread) and serves exactly one request."""
     import webbrowser, secrets, threading, time  # lazy: OIDC-only
     from urllib.parse import urlencode           # lazy: OIDC-only
@@ -536,12 +536,12 @@ def _loopback_receive_code(*, state: str, timeout: float, login_hint: str = "") 
         raise OidcError("sign-in timed out or was cancelled")
     if captured.get("error"):
         raise OidcError(f"authorize error: {captured.get('error')}")
-    if captured.get("state") != state:
+    if not secrets.compare_digest(captured.get("state") or "", state):
         raise OidcError("state mismatch on loopback callback (rejected)")
     code = captured.get("code")
     if not code:
         raise OidcError("no code on loopback callback")
-    return code, redirect_uri, verifier
+    return code, redirect_uri, verifier, nonce
 
 
 def _exchange_code(code: str, verifier: str, redirect_uri: str) -> dict:
@@ -563,6 +563,24 @@ def _exchange_code(code: str, verifier: str, redirect_uri: str) -> dict:
     if not data_out.get("access_token"):
         raise OidcError(f"token response missing access_token: {r.text[:200]}")
     return data_out
+
+
+def _verify_id_token_nonce(toks: dict, expected_nonce: str) -> None:
+    """Bind the id_token (if present) to THIS request via its nonce claim
+    (token-replay/injection defense, design §2/§10). Signature isn't verified
+    client-side — the token came directly from Entra over TLS in the code
+    exchange, and the access token is pa_v2's actual trust anchor. If no
+    id_token is present, skip — don't fail (scope doesn't guarantee one)."""
+    id_token = toks.get("id_token")
+    if not id_token:
+        return
+    import jwt  # lazy: OIDC-only
+    import secrets  # lazy: OIDC-only (constant-time compare)
+    claims = jwt.decode(id_token, options={"verify_signature": False,
+                                            "verify_aud": False,
+                                            "verify_exp": False})
+    if not secrets.compare_digest(claims.get("nonce") or "", expected_nonce):
+        raise OidcError("id_token nonce mismatch")
 
 
 def _refresh_token(refresh_token: str) -> dict:
@@ -673,9 +691,10 @@ def _oidc_acquire_token(upn: str, *, allow_interactive: bool) -> str:
     if not allow_interactive:
         raise OidcError("no usable OIDC token and interactive sign-in not allowed here")
     state = secrets.token_urlsafe(24)
-    code, redirect_uri, verifier = _loopback_receive_code(
+    code, redirect_uri, verifier, nonce = _loopback_receive_code(
         state=state, timeout=_OIDC_INTERACTIVE_TIMEOUT, login_hint=upn)
     toks = _exchange_code(code, verifier, redirect_uri)
+    _verify_id_token_nonce(toks, nonce)
     _persist_tokens(upn, toks)
     return toks["access_token"]
 

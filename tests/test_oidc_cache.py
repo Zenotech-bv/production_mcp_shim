@@ -64,7 +64,7 @@ def test_acquire_interactive_when_allowed_and_no_cache(monkeypatch):
     shim = _shim()
     monkeypatch.setattr(shim, "_token_cache_read", lambda u: None)
     monkeypatch.setattr(shim, "_loopback_receive_code",
-                        lambda *, state, timeout, login_hint="": ("CODE", "http://localhost:5000", "VER"))
+                        lambda *, state, timeout, login_hint="": ("CODE", "http://localhost:5000", "VER", "NONCE"))
     monkeypatch.setattr(shim, "_exchange_code",
                         lambda code, ver, ru: {"access_token": "IAT", "refresh_token": "IRT",
                                                "expires_in": 3600})
@@ -90,7 +90,7 @@ def test_acquire_refresh_fails_then_interactive_succeeds(monkeypatch):
 
     monkeypatch.setattr(shim, "_refresh_token", _fail_refresh)
     monkeypatch.setattr(shim, "_loopback_receive_code",
-                        lambda *, state, timeout, login_hint="": ("CODE", "http://localhost:5000", "VER"))
+                        lambda *, state, timeout, login_hint="": ("CODE", "http://localhost:5000", "VER", "NONCE"))
     monkeypatch.setattr(shim, "_exchange_code",
                         lambda code, ver, ru: {"access_token": "IAT2", "refresh_token": "IRT2",
                                                "expires_in": 3600})
