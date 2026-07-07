@@ -553,7 +553,10 @@ def _exchange_code(code: str, verifier: str, redirect_uri: str) -> dict:
     r = httpx.post(_OIDC_TOKEN, data=data, timeout=_OIDC_HTTP_TIMEOUT)
     if r.status_code != 200:
         raise OidcError(f"token exchange failed: {r.status_code} {r.text[:200]}")
-    return r.json()
+    data_out = r.json()
+    if not data_out.get("access_token"):
+        raise OidcError(f"token response missing access_token: {r.text[:200]}")
+    return data_out
 
 
 def _refresh_token(refresh_token: str) -> dict:
@@ -564,7 +567,10 @@ def _refresh_token(refresh_token: str) -> dict:
     r = httpx.post(_OIDC_TOKEN, data=data, timeout=_OIDC_HTTP_TIMEOUT)
     if r.status_code != 200:
         raise OidcError(f"refresh failed: {r.status_code} {r.text[:200]}")
-    return r.json()
+    data_out = r.json()
+    if not data_out.get("access_token"):
+        raise OidcError(f"token response missing access_token: {r.text[:200]}")
+    return data_out
 
 
 def _oidc_cache_dir():
@@ -603,7 +609,7 @@ def _dpapi_unprotect(blob: bytes) -> bytes:
 
 
 def _token_cache_write(upn: str, tokens: dict) -> None:
-    import json, base64  # lazy for json? json is stdlib+cheap; keep base64 lazy
+    import json, base64  # lazy: both are cheap stdlib, but kept out of module load with the rest of OIDC
     payload = json.dumps(tokens).encode("utf-8")
     path = _oidc_cache_path(upn)
     try:
@@ -614,7 +620,9 @@ def _token_cache_write(upn: str, tokens: dict) -> None:
             path.write_bytes(b"PLAIN:" + base64.b64encode(payload))
         try:
             import os as _os
-            _os.chmod(path, 0o600)   # best-effort owner-only
+            _os.chmod(path, 0o600)   # on Windows this only clears the read-only attribute bit,
+            # not owner/other perms; real isolation is NTFS ACLs inherited from the
+            # per-user %LOCALAPPDATA% dir, plus DPAPI. Harmless best-effort elsewhere.
         except OSError:
             pass
     except OSError as e:
@@ -665,10 +673,14 @@ def _oidc_acquire_token(upn: str, *, allow_interactive: bool) -> str:
 
 def _persist_tokens(upn: str, toks: dict) -> None:
     import time as _t  # lazy
+    try:
+        exp = int(toks.get("expires_in", 3600))
+    except (ValueError, TypeError):
+        exp = 3600
     rec = {
         "access_token": toks.get("access_token"),
         "refresh_token": toks.get("refresh_token"),
-        "expires_at": _t.time() + int(toks.get("expires_in", 3600)),
+        "expires_at": _t.time() + exp,
     }
     _token_cache_write(upn, rec)
 

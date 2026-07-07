@@ -73,3 +73,60 @@ def test_acquire_interactive_when_allowed_and_no_cache(monkeypatch):
     tok = shim._oidc_acquire_token("eve@punchpowertrain.com", allow_interactive=True)
     assert tok == "IAT"
     assert saved["refresh_token"] == "IRT"
+
+
+def test_acquire_refresh_fails_then_interactive_succeeds(monkeypatch):
+    """Cache has an EXPIRED access token + a refresh_token; the refresh call
+    fails (OidcError). Falling through to interactive sign-in must still
+    succeed and return the freshly-acquired access token."""
+    shim = _shim()
+    upn = "frank@punchpowertrain.com"
+    monkeypatch.setattr(shim, "_token_cache_read",
+                        lambda u: {"access_token": "OLD", "refresh_token": "RT",
+                                   "expires_at": time.time() - 10})
+
+    def _fail_refresh(rt):
+        raise shim.OidcError("refresh failed: 400 invalid_grant")
+
+    monkeypatch.setattr(shim, "_refresh_token", _fail_refresh)
+    monkeypatch.setattr(shim, "_loopback_receive_code",
+                        lambda *, state, timeout, login_hint="": ("CODE", "http://localhost:5000", "VER"))
+    monkeypatch.setattr(shim, "_exchange_code",
+                        lambda code, ver, ru: {"access_token": "IAT2", "refresh_token": "IRT2",
+                                               "expires_in": 3600})
+    saved = {}
+    monkeypatch.setattr(shim, "_token_cache_write", lambda u, t: saved.update(t))
+    tok = shim._oidc_acquire_token(upn, allow_interactive=True)
+    assert tok == "IAT2"
+    assert saved["refresh_token"] == "IRT2"
+
+
+def test_acquire_refresh_fails_no_interactive_raises(monkeypatch):
+    """Same expired-access + refresh-token cache, but refresh fails and
+    interactive sign-in is NOT allowed (e.g. a background/non-interactive
+    caller). Must raise OidcError -- never fall back to a stale or None
+    token."""
+    shim = _shim()
+    upn = "grace@punchpowertrain.com"
+    monkeypatch.setattr(shim, "_token_cache_read",
+                        lambda u: {"access_token": "OLD", "refresh_token": "RT",
+                                   "expires_at": time.time() - 10})
+
+    def _fail_refresh(rt):
+        raise shim.OidcError("refresh failed: 400 invalid_grant")
+
+    monkeypatch.setattr(shim, "_refresh_token", _fail_refresh)
+    with pytest.raises(shim.OidcError):
+        shim._oidc_acquire_token(upn, allow_interactive=False)
+
+
+def test_exchange_code_missing_access_token_raises_oidc_error():
+    """A 200 response that omits access_token (malformed/hostile IdP
+    response) must surface as OidcError, matching the documented
+    '_oidc_acquire_token raises OidcError' contract -- not an unhandled
+    KeyError escaping the caller's `except OidcError`."""
+    import httpx
+    shim = _shim()
+    with patch("httpx.post", lambda *a, **k: httpx.Response(200, json={"token_type": "Bearer"})):
+        with pytest.raises(shim.OidcError, match="access_token"):
+            shim._exchange_code("CODE", "VERIFIER", "http://localhost:5000")
