@@ -685,6 +685,49 @@ def _persist_tokens(upn: str, toks: dict) -> None:
     _token_cache_write(upn, rec)
 
 
+def _local_windows_upn() -> str | None:
+    """Resolve the logged-in Windows UPN offline (no DC/Kerberos). Tries
+    pywin32 GetUserNameEx(NameUserPrincipal), then `whoami /upn`, then env."""
+    # 1) pywin32
+    try:
+        import win32api  # lazy
+        NameUserPrincipal = 8
+        upn = win32api.GetUserNameEx(NameUserPrincipal)
+        if upn and "@" in upn:
+            return upn.strip().lower()
+    except Exception:
+        pass
+    # 2) whoami /upn
+    try:
+        import subprocess  # lazy
+        out = subprocess.run(["whoami", "/upn"], capture_output=True, text=True, timeout=5)
+        cand = out.stdout.strip()
+        if cand and "@" in cand:
+            return cand.lower()
+    except Exception:
+        pass
+    # 3) env
+    user = os.environ.get("USERNAME", "").strip()
+    dom = os.environ.get("USERDNSDOMAIN", "").strip()
+    if user and dom:
+        return f"{user}@{dom}".lower()
+    return None
+
+
+def _query_auth_mode(base_url: str, upn: str) -> str:
+    """Ask the server which auth this user should use. Kerberos-independent
+    (unauthenticated GET). Returns 'oidc' ONLY on an explicit 200 'oidc';
+    everything else (non-200, non-'oidc' body, network error) -> 'kerberos'."""
+    try:
+        r = httpx.get(base_url.rstrip("/") + "/auth/mode",
+                      params={"upn": upn}, timeout=5.0)
+        if r.status_code == 200 and r.text.strip().lower() == "oidc":
+            return "oidc"
+    except Exception as e:
+        _log_event("auth_mode_query_failed", level=logging.WARNING, error=str(e))
+    return "kerberos"
+
+
 class OidcAuth(httpx.Auth):
     """Entra OIDC Bearer for httpx. Attaches `Authorization: Bearer <token>`,
     acquiring/refreshing via the module-level _oidc_acquire_token (Tasks 2-3).
@@ -719,6 +762,7 @@ class Backend:
     # is NEVER edited — this is the override channel.
     effective_auth: str = ""
     _oidc_upn: str = ""   # the local UPN the decision function resolved (Task 4)
+    _fell_back: bool = False   # directed oidc but fell back to negotiate this session
 
     def __post_init__(self):
         self.url = self.url.rstrip("/")
@@ -773,6 +817,7 @@ class Backend:
             "X-Punch-Shim-Bundled-Version": bundled_v,
             "X-Punch-Shim-Version": _SHIM_VERSION,
             "X-Punch-Shim-Pid": str(os.getpid()),
+            "X-Punch-Shim-Auto-Update": "1" if _AUTO_UPDATE else "0",
         }
         auth: httpx.Auth | None = None
         mode = self.effective_auth or self.auth
@@ -788,6 +833,8 @@ class Backend:
             auth = OidcAuth(self._oidc_upn or "")
         else:
             headers[self.header] = self.key
+        if self._fell_back:
+            headers["X-Punch-Auth-Fallback"] = "oidc->negotiate"
         return httpx.Client(
             base_url=self.url,
             timeout=timeouts,
@@ -796,6 +843,37 @@ class Backend:
             auth=auth,
             headers=headers,
         )
+
+
+def _apply_auth_directives(backends: list[Backend]) -> list[Backend]:
+    """Confirm-before-switch: for each backend the server directs to OIDC AND
+    for which we can (silently, else once-interactively) acquire a token, set
+    effective_auth='oidc'. Otherwise stay 'negotiate' (never override a working
+    Kerberos backend with an unconfirmed directive). Runs at startup."""
+    upn = _local_windows_upn()
+    if not upn:
+        _log_event("oidc_no_local_upn", level=logging.INFO)
+        return backends
+    for b in backends:
+        # Only humans (negotiate) are candidates; x-punch-auth service backends stay put.
+        if b.auth != "negotiate":
+            continue
+        directive = _query_auth_mode(b.url, upn)
+        if directive != "oidc":
+            continue
+        try:
+            # Silent first; interactive allowed once (first activation). Bounded.
+            _oidc_acquire_token(upn, allow_interactive=True)
+            b.effective_auth = "oidc"
+            b._oidc_upn = upn
+            b._fell_back = False
+            _log_event("oidc_cutover_confirmed", backend=b.name, upn=upn)
+        except OidcError as e:
+            b.effective_auth = "negotiate"     # fail-safe: stay on Kerberos this session
+            b._fell_back = True
+            _log_event("oidc_fallback_to_negotiate", level=logging.WARNING,
+                       backend=b.name, upn=upn, error=str(e))
+    return backends
 
 
 def _resolve_backends_path() -> Path:
@@ -1461,6 +1539,7 @@ def _discover_backends(backends: list[Backend]) -> list[Backend]:
 
 _BACKENDS, _PRIMARY = _load_backends()
 _BACKENDS = _discover_backends(_BACKENDS)
+_BACKENDS = _apply_auth_directives(_BACKENDS)
 
 
 # v2.3.1: prime the hot-reload mtime tracker so the FIRST throttle window
@@ -2429,6 +2508,11 @@ async def shim_reload(ctx: Context) -> str:
     this after a backend gains, drops, or changes a tool."""
     try:
         r = _apply_catalogue_reload()
+
+        global _BACKENDS
+        _BACKENDS = _apply_auth_directives(_BACKENDS)
+        _log_event("oidc_reprobe", backend_names=[b.name for b in _BACKENDS])
+
         if r["moved"]:
             await ctx.session.send_tool_list_changed()
 
