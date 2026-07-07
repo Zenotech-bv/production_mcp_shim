@@ -441,6 +441,132 @@ class NegotiateAuth(httpx.Auth):
             response = yield request
 
 
+_OIDC_TENANT    = "1c517a07-0e28-4923-a932-cace3138e782"
+_OIDC_CLIENT_ID = "71b30538-8e08-47c6-ab2e-1ca23ce68488"
+_OIDC_SCOPE     = "api://a23d5e91-7dd8-4544-8a04-a471bb731406/access_as_user offline_access openid"
+_OIDC_AUTHORIZE = f"https://login.microsoftonline.com/{_OIDC_TENANT}/oauth2/v2.0/authorize"
+_OIDC_TOKEN     = f"https://login.microsoftonline.com/{_OIDC_TENANT}/oauth2/v2.0/token"
+_OIDC_HTTP_TIMEOUT = 20.0
+_OIDC_INTERACTIVE_TIMEOUT = 120.0  # bounded browser sign-in wait
+
+
+class OidcError(Exception):
+    """OIDC token acquisition failed (network, user cancel, bad state, etc.)."""
+
+
+def _pkce_pair() -> tuple[str, str]:
+    import secrets, hashlib, base64  # lazy: OIDC-only
+    verifier = secrets.token_urlsafe(64)[:128]
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode("ascii")).digest()
+    ).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def _loopback_serve_once(port_holder: dict, timeout: float) -> dict:
+    """Bind an http.server on 127.0.0.1:0, put the chosen port in port_holder,
+    serve exactly ONE request, and return the parsed query {code,state} (or
+    {error:...}). Lazy-imports http.server. 127.0.0.1 only; shut down after one hit."""
+    import http.server, urllib.parse  # lazy: OIDC-only
+    result: dict = {}
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            q = urllib.parse.urlparse(self.path).query
+            result.update({k: v[0] for k, v in urllib.parse.parse_qs(q).items()})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<html><body>Punch sign-in complete. You can close this tab.</body></html>")
+
+        def log_message(self, *a):  # silence
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    port_holder["port"] = srv.server_address[1]
+    srv.timeout = timeout
+    srv.handle_request()  # exactly one; blocks up to `timeout`
+    srv.server_close()
+    return result
+
+
+def _loopback_receive_code(*, state: str, timeout: float, login_hint: str = "") -> tuple[str, str, str]:
+    """Open the browser to the authorize URL and receive the code on a loopback
+    listener. Returns (code, redirect_uri, code_verifier). Raises OidcError on
+    timeout / user cancel / state mismatch. Binds 127.0.0.1 on an ephemeral port
+    (via _loopback_serve_once, in a daemon thread) and serves exactly one request."""
+    import webbrowser, secrets, threading, time  # lazy: OIDC-only
+    from urllib.parse import urlencode           # lazy: OIDC-only
+
+    verifier, challenge = _pkce_pair()
+    nonce = secrets.token_urlsafe(24)
+    holder: dict = {}     # the server thread sets holder["port"] once bound
+    captured: dict = {}   # the single callback's {code,state,error}
+
+    def _serve():
+        captured.update(_loopback_serve_once(holder, timeout))
+
+    t = threading.Thread(target=_serve, daemon=True)
+    t.start()
+    for _ in range(200):          # wait up to ~2s for the ephemeral port to bind
+        if "port" in holder or not t.is_alive():
+            # Either the real listener bound (holder["port"] set), or the
+            # server thread already finished — e.g. a test double for
+            # _loopback_serve_once that returns immediately without ever
+            # touching port_holder. Don't treat the latter as a bind failure;
+            # let the state/code checks below produce the right error.
+            break
+        time.sleep(0.01)
+    if "port" not in holder and t.is_alive():
+        raise OidcError("loopback listener did not bind")
+    redirect_uri = f"http://localhost:{holder['port']}" if "port" in holder else ""
+
+    params = {
+        "client_id": _OIDC_CLIENT_ID, "response_type": "code",
+        "redirect_uri": redirect_uri, "scope": _OIDC_SCOPE,
+        "code_challenge": challenge, "code_challenge_method": "S256",
+        "state": state, "nonce": nonce,
+    }
+    if login_hint:
+        params["login_hint"] = login_hint
+    webbrowser.open(_OIDC_AUTHORIZE + "?" + urlencode(params))
+
+    t.join(timeout + 5)
+    if not captured:
+        raise OidcError("sign-in timed out or was cancelled")
+    if captured.get("error"):
+        raise OidcError(f"authorize error: {captured.get('error')}")
+    if captured.get("state") != state:
+        raise OidcError("state mismatch on loopback callback (rejected)")
+    code = captured.get("code")
+    if not code:
+        raise OidcError("no code on loopback callback")
+    return code, redirect_uri, verifier
+
+
+def _exchange_code(code: str, verifier: str, redirect_uri: str) -> dict:
+    data = {
+        "grant_type": "authorization_code", "client_id": _OIDC_CLIENT_ID,
+        "code": code, "redirect_uri": redirect_uri, "code_verifier": verifier,
+        "scope": _OIDC_SCOPE,
+    }
+    r = httpx.post(_OIDC_TOKEN, data=data, timeout=_OIDC_HTTP_TIMEOUT)
+    if r.status_code != 200:
+        raise OidcError(f"token exchange failed: {r.status_code} {r.text[:200]}")
+    return r.json()
+
+
+def _refresh_token(refresh_token: str) -> dict:
+    data = {
+        "grant_type": "refresh_token", "client_id": _OIDC_CLIENT_ID,
+        "refresh_token": refresh_token, "scope": _OIDC_SCOPE,
+    }
+    r = httpx.post(_OIDC_TOKEN, data=data, timeout=_OIDC_HTTP_TIMEOUT)
+    if r.status_code != 200:
+        raise OidcError(f"refresh failed: {r.status_code} {r.text[:200]}")
+    return r.json()
+
+
 def _oidc_acquire_token(upn: str, *, allow_interactive: bool) -> str:
     raise NotImplementedError("implemented in Slice B Task 3")
 
