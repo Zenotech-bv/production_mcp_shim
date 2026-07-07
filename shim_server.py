@@ -193,7 +193,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # launch, so the env converges with no per-laptop action. Best-effort +
 # idempotent; never blocks startup. Logic change, but no behaviour change for
 # an already-fixed (v3.4.3+) manifest — it's a no-op there.
-_SHIM_VERSION = "3.4.6"
+_SHIM_VERSION = "3.5.0"
 
 
 # ---------------------------------------------------------------------------
