@@ -401,7 +401,7 @@ def _log_event(event: str, level: int = logging.INFO, **fields):
 # ---------------------------------------------------------------------------
 
 
-_VALID_AUTH_MODES = ("x-punch-auth", "negotiate")
+_VALID_AUTH_MODES = ("x-punch-auth", "negotiate", "oidc")
 
 
 class NegotiateAuth(httpx.Auth):
@@ -441,6 +441,24 @@ class NegotiateAuth(httpx.Auth):
             response = yield request
 
 
+def _oidc_acquire_token(upn: str, *, allow_interactive: bool) -> str:
+    raise NotImplementedError("implemented in Slice B Task 3")
+
+
+class OidcAuth(httpx.Auth):
+    """Entra OIDC Bearer for httpx. Attaches `Authorization: Bearer <token>`,
+    acquiring/refreshing via the module-level _oidc_acquire_token (Tasks 2-3).
+    Mirrors NegotiateAuth; all OIDC-only imports are lazy in the token helpers."""
+
+    def __init__(self, upn: str):
+        self._upn = upn
+
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        token = _oidc_acquire_token(self._upn, allow_interactive=False)
+        request.headers["Authorization"] = f"Bearer {token}"
+        yield request
+
+
 @dataclass
 class Backend:
     """One backend MCP server. Each backend has its own URL + auth +
@@ -455,6 +473,12 @@ class Backend:
     auth: str = "x-punch-auth"
     # Filled in at fetch time; empty until _load_tools_multi runs.
     tools: list[dict] = field(default_factory=list)
+    # Runtime-computed effective auth mode. Defaults to `auth`; the startup
+    # decision function (_apply_auth_directives) may raise it to "oidc" for a
+    # human backend the server directs + we can acquire a token for. backends.json
+    # is NEVER edited — this is the override channel.
+    effective_auth: str = ""
+    _oidc_upn: str = ""   # the local UPN the decision function resolved (Task 4)
 
     def __post_init__(self):
         self.url = self.url.rstrip("/")
@@ -469,12 +493,14 @@ class Backend:
             _log_event("backend_unknown_auth_mode", level=logging.WARNING,
                        backend=self.name, auth=self.auth,
                        valid_modes=list(_VALID_AUTH_MODES))
-            self.auth = "x-punch-auth"  # safe-fail; is_configured will catch missing key
+            self.auth = "negotiate"   # safe human default (a human row has no key)
+        if not self.effective_auth:
+            self.effective_auth = self.auth
 
     @property
     def is_configured(self) -> bool:
-        if self.auth == "negotiate":
-            # No key required — the Windows logon ticket is the credential.
+        if self.auth in ("negotiate", "oidc"):
+            # No key required — the Windows logon ticket / OIDC token is the credential.
             return bool(self.url)
         return bool(self.url and self.key and self.header)
 
@@ -489,6 +515,11 @@ class Backend:
         v3.0.0 — when self.auth == "negotiate", attaches a NegotiateAuth
         and omits the X-Punch-Auth header. Otherwise (default
         "x-punch-auth") behaves exactly as before.
+
+        Slice B — dispatches on `effective_auth` (falls back to `auth` if
+        unset) so a startup decision function can raise a human backend to
+        "oidc" without editing backends.json. "oidc" attaches an OidcAuth
+        and, like "negotiate", omits the X-Punch-Auth header.
         """
         rt = read_timeout if read_timeout is not None else PUNCH_SAP_TIMEOUT
         timeouts = httpx.Timeout(connect=5.0, read=rt, write=10.0, pool=5.0)
@@ -504,7 +535,8 @@ class Backend:
             "X-Punch-Shim-Pid": str(os.getpid()),
         }
         auth: httpx.Auth | None = None
-        if self.auth == "negotiate":
+        mode = self.effective_auth or self.auth
+        if mode == "negotiate":
             host = urlparse(self.url).hostname
             if not host:
                 raise ValueError(
@@ -512,6 +544,8 @@ class Backend:
                     f"URL with a hostname; got {self.url!r}"
                 )
             auth = NegotiateAuth(host)
+        elif mode == "oidc":
+            auth = OidcAuth(self._oidc_upn or "")
         else:
             headers[self.header] = self.key
         return httpx.Client(
