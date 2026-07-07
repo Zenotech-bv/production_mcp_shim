@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import importlib
-from unittest.mock import patch
 
 import httpx
-import pytest
 
 
 def _shim():
@@ -81,6 +79,77 @@ def test_no_local_upn_stays_negotiate(monkeypatch):
                         lambda *a: (_ for _ in ()).throw(AssertionError("should not query")))
     out = shim._apply_auth_directives([b])
     assert out[0].effective_auth == "negotiate"
+
+
+def test_apply_directives_network_error_stays_negotiate(monkeypatch):
+    """Fix 1b (defense in depth): a non-OidcError raised from the OIDC
+    acquisition path (e.g. httpx.ConnectError, a RequestError subclass, NOT
+    an OidcError) must be swallowed by _apply_auth_directives, not propagate.
+    This runs at module import (`_apply_auth_directives(_BACKENDS)`), so an
+    uncaught exception here would crash the entire shim on a network blip."""
+    shim = _shim()
+    b = _mk_backend(shim)
+    monkeypatch.setattr(shim, "_local_windows_upn", lambda: "a@p.com")
+    monkeypatch.setattr(shim, "_query_auth_mode", lambda url, upn: "oidc")
+
+    def _boom(upn, *, allow_interactive):
+        raise httpx.ConnectError("down")
+    monkeypatch.setattr(shim, "_oidc_acquire_token", _boom)
+
+    out = shim._apply_auth_directives([b])   # must not raise
+    assert out[0].effective_auth == "negotiate"
+    assert out[0]._fell_back is True
+
+
+def test_apply_directives_reprobe_flip_back_reverts(monkeypatch):
+    """Fix 2: _apply_auth_directives runs again on shim_reload over the SAME
+    Backend objects. A pass that confirms oidc, followed by a pass whose
+    directive reverts to kerberos, must fully revert effective_auth/_oidc_upn/
+    _fell_back back to base state (not leave stale oidc state around)."""
+    shim = _shim()
+    b = _mk_backend(shim)
+    monkeypatch.setattr(shim, "_local_windows_upn", lambda: "a@p.com")
+
+    # Pass 1: directive=oidc, token acquisition succeeds.
+    monkeypatch.setattr(shim, "_query_auth_mode", lambda url, upn: "oidc")
+    monkeypatch.setattr(shim, "_oidc_acquire_token", lambda upn, *, allow_interactive: "AT")
+    out = shim._apply_auth_directives([b])
+    assert out[0].effective_auth == "oidc"
+    assert out[0]._oidc_upn == "a@p.com"
+    assert out[0]._fell_back is False
+
+    # Pass 2: server flips the directive back to kerberos.
+    monkeypatch.setattr(shim, "_query_auth_mode", lambda url, upn: "kerberos")
+    out = shim._apply_auth_directives(out)
+    assert out[0].effective_auth == "negotiate"
+    assert out[0]._oidc_upn == ""
+    assert out[0]._fell_back is False
+
+
+def test_apply_directives_reprobe_flip_back_clears_stale_fallback(monkeypatch):
+    """Variant of the above: first pass directive=oidc but token acquisition
+    FAILS (leaves _fell_back=True). A later pass whose directive reverts to
+    kerberos must clear the stale _fell_back flag too, so the backend stops
+    sending X-Punch-Auth-Fallback forever."""
+    shim = _shim()
+    b = _mk_backend(shim)
+    monkeypatch.setattr(shim, "_local_windows_upn", lambda: "a@p.com")
+
+    # Pass 1: directive=oidc, token acquisition fails -> fallback.
+    monkeypatch.setattr(shim, "_query_auth_mode", lambda url, upn: "oidc")
+
+    def _fail(upn, *, allow_interactive):
+        raise shim.OidcError("browser cancelled")
+    monkeypatch.setattr(shim, "_oidc_acquire_token", _fail)
+    out = shim._apply_auth_directives([b])
+    assert out[0].effective_auth == "negotiate"
+    assert out[0]._fell_back is True
+
+    # Pass 2: directive reverts to kerberos -> stale _fell_back must clear.
+    monkeypatch.setattr(shim, "_query_auth_mode", lambda url, upn: "kerberos")
+    out = shim._apply_auth_directives(out)
+    assert out[0].effective_auth == "negotiate"
+    assert out[0]._fell_back is False
 
 
 def test_fell_back_backend_sends_fallback_header():

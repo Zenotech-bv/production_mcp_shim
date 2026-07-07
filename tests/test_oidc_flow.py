@@ -49,6 +49,33 @@ def test_exchange_code_raises_on_error_response():
             shim._exchange_code("bad", "v", "http://localhost:5000")
 
 
+def test_exchange_code_network_error_raises_oidc_error():
+    """Fix 1a: a network failure (DNS/VPN/timeout -> httpx.RequestError, NOT
+    an HTTP error response) must still surface as OidcError, not escape as
+    the raw httpx.ConnectError. _exchange_code's contract is 'raises
+    OidcError' unconditionally."""
+    shim = _shim()
+
+    def _boom(*a, **k):
+        raise httpx.ConnectError("down")
+
+    with patch("httpx.post", _boom):
+        with pytest.raises(shim.OidcError):
+            shim._exchange_code("CODE", "VERIFIER", "http://localhost:5000")
+
+
+def test_refresh_token_network_error_raises_oidc_error():
+    """Same as above, for _refresh_token."""
+    shim = _shim()
+
+    def _boom(*a, **k):
+        raise httpx.ConnectError("down")
+
+    with patch("httpx.post", _boom):
+        with pytest.raises(shim.OidcError):
+            shim._refresh_token("RT")
+
+
 def test_loopback_rejects_state_mismatch():
     """A callback whose state doesn't match must be rejected (CSRF guard)."""
     shim = _shim()

@@ -550,7 +550,13 @@ def _exchange_code(code: str, verifier: str, redirect_uri: str) -> dict:
         "code": code, "redirect_uri": redirect_uri, "code_verifier": verifier,
         "scope": _OIDC_SCOPE,
     }
-    r = httpx.post(_OIDC_TOKEN, data=data, timeout=_OIDC_HTTP_TIMEOUT)
+    try:
+        r = httpx.post(_OIDC_TOKEN, data=data, timeout=_OIDC_HTTP_TIMEOUT)
+    except httpx.RequestError as e:
+        # DNS/VPN/timeout etc. — a network failure, not an HTTP error response.
+        # Must still surface as OidcError so callers (and _apply_auth_directives'
+        # narrower `except OidcError`, pre-Fix-1b) can catch it uniformly.
+        raise OidcError(f"token endpoint unreachable: {e}") from e
     if r.status_code != 200:
         raise OidcError(f"token exchange failed: {r.status_code} {r.text[:200]}")
     data_out = r.json()
@@ -564,7 +570,10 @@ def _refresh_token(refresh_token: str) -> dict:
         "grant_type": "refresh_token", "client_id": _OIDC_CLIENT_ID,
         "refresh_token": refresh_token, "scope": _OIDC_SCOPE,
     }
-    r = httpx.post(_OIDC_TOKEN, data=data, timeout=_OIDC_HTTP_TIMEOUT)
+    try:
+        r = httpx.post(_OIDC_TOKEN, data=data, timeout=_OIDC_HTTP_TIMEOUT)
+    except httpx.RequestError as e:
+        raise OidcError(f"token endpoint unreachable: {e}") from e
     if r.status_code != 200:
         raise OidcError(f"refresh failed: {r.status_code} {r.text[:200]}")
     data_out = r.json()
@@ -858,17 +867,28 @@ def _apply_auth_directives(backends: list[Backend]) -> list[Backend]:
         # Only humans (negotiate) are candidates; x-punch-auth service backends stay put.
         if b.auth != "negotiate":
             continue
+        # Reset to base state EVERY pass (this runs again on shim_reload, over
+        # the SAME Backend objects). Without this, a directive that reverts
+        # oidc->kerberos would leave a stale effective_auth="oidc" (or a stale
+        # _fell_back=True) from a prior pass, since the `directive != "oidc"`
+        # continue below never reaches the assignment that would clear it.
+        b.effective_auth = b.auth   # negotiate
+        b._oidc_upn = ""
+        b._fell_back = False
         directive = _query_auth_mode(b.url, upn)
         if directive != "oidc":
             continue
         try:
             # Silent first; interactive allowed once (first activation). Bounded.
+            # Broad except: this is a startup/reprobe decision path and must
+            # NEVER crash the shim (it runs at module import), no matter what
+            # the OIDC path raises — network errors, or anything else.
             _oidc_acquire_token(upn, allow_interactive=True)
             b.effective_auth = "oidc"
             b._oidc_upn = upn
             b._fell_back = False
             _log_event("oidc_cutover_confirmed", backend=b.name, upn=upn)
-        except OidcError as e:
+        except Exception as e:
             b.effective_auth = "negotiate"     # fail-safe: stay on Kerberos this session
             b._fell_back = True
             _log_event("oidc_fallback_to_negotiate", level=logging.WARNING,
