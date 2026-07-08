@@ -193,7 +193,11 @@ from mcp.server.fastmcp import Context, FastMCP
 # launch, so the env converges with no per-laptop action. Best-effort +
 # idempotent; never blocks startup. Logic change, but no behaviour change for
 # an already-fixed (v3.4.3+) manifest — it's a no-op there.
-_SHIM_VERSION = "3.5.0"
+_SHIM_VERSION = "3.5.1"
+# v3.5.1 — auto-update no longer re-execs in-session (os.execv breaks Claude
+#          Desktop's stdio pipe on Windows and mangles the spaced install
+#          path). Updates now stage to disk and apply on the next launch.
+#          See _maybe_self_update.
 
 
 # ---------------------------------------------------------------------------
@@ -1753,16 +1757,19 @@ def _maybe_self_update() -> None:
                    error=f"{type(e).__name__}: {e}")
         return
 
-    _log_event("auto_update_applied", from_version=_SHIM_VERSION,
+    # v3.5.1: DO NOT re-exec in-session. os.execv on Windows spawns a NEW
+    # process instead of replacing in place, which (a) drops the stdio pipe
+    # Claude Desktop launched us with, and (b) mangles the space in the
+    # "Claude Extensions" install path — python then receives a truncated
+    # path and exits "early". Either way the client sees the server
+    # disconnect on the very launch that pulls the update. Instead we STAGE:
+    # the new bytes are already on disk (os.replace above); this session keeps
+    # running the current code, and the new version is picked up on the next
+    # natural Claude Desktop launch (whose up-to-date check then no-ops).
+    _log_event("auto_update_staged", from_version=_SHIM_VERSION,
                to_version=server_version, source=source_label,
-               backup_path=str(backup_path))
-
-    try:
-        os.execv(sys.executable, [sys.executable, str(self_path), *sys.argv[1:]])
-    except OSError as e:
-        _log_event("auto_update_fail", level=logging.ERROR,
-                   reason="execv_failed",
-                   error=f"{type(e).__name__}: {e}")
+               backup_path=str(backup_path),
+               note="applies on next launch (no in-session relaunch)")
 
 
 # ---------------------------------------------------------------------------
