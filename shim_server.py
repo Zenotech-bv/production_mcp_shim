@@ -128,6 +128,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import base64
 from collections import defaultdict
@@ -193,7 +194,13 @@ from mcp.server.fastmcp import Context, FastMCP
 # launch, so the env converges with no per-laptop action. Best-effort +
 # idempotent; never blocks startup. Logic change, but no behaviour change for
 # an already-fixed (v3.4.3+) manifest — it's a no-op there.
-_SHIM_VERSION = "3.5.1"
+_SHIM_VERSION = "3.5.2"
+# v3.5.2 — OIDC directive pre-flight (the /auth/mode probe, token refresh, and
+#          up-to-120s first-time interactive sign-in) moved OFF the startup path
+#          onto a background daemon thread. shim_ready is no longer gated on
+#          network round-trips; a backend keeps its working negotiate credential
+#          until the directive resolves, then flips to oidc in place. See
+#          _apply_auth_directives_async.
 # v3.5.1 — auto-update no longer re-execs in-session (os.execv breaks Claude
 #          Desktop's stdio pipe on Windows and mangles the spaced install
 #          path). Updates now stage to disk and apply on the next launch.
@@ -853,6 +860,14 @@ class Backend:
         }
         auth: httpx.Auth | None = None
         mode = self.effective_auth or self.auth
+        # v3.5.2 - snapshot _oidc_upn alongside the mode. The background directive
+        # pre-flight (another thread) can flip effective_auth and clear/set
+        # _oidc_upn between our reads; if we observe mode "oidc" without a
+        # published upn (mid-resolution, or a reprobe reset), use the working
+        # negotiate path rather than build an unusable OidcAuth("").
+        oidc_upn = self._oidc_upn
+        if mode == "oidc" and not oidc_upn:
+            mode = "negotiate"
         if mode == "negotiate":
             host = urlparse(self.url).hostname
             if not host:
@@ -862,7 +877,7 @@ class Backend:
                 )
             auth = NegotiateAuth(host)
         elif mode == "oidc":
-            auth = OidcAuth(self._oidc_upn or "")
+            auth = OidcAuth(oidc_upn)
         else:
             headers[self.header] = self.key
         if self._fell_back:
@@ -877,46 +892,94 @@ class Backend:
         )
 
 
-def _apply_auth_directives(backends: list[Backend]) -> list[Backend]:
+_AUTH_DIRECTIVE_LOCK = threading.Lock()
+
+
+def _apply_auth_directives(backends: list[Backend], *, block: bool = True,
+                           allow_interactive: bool = True) -> list[Backend]:
     """Confirm-before-switch: for each backend the server directs to OIDC AND
     for which we can (silently, else once-interactively) acquire a token, set
     effective_auth='oidc'. Otherwise stay 'negotiate' (never override a working
-    Kerberos backend with an unconfirmed directive). Runs at startup."""
-    upn = _local_windows_upn()
-    if not upn:
-        _log_event("oidc_no_local_upn", level=logging.INFO)
+    Kerberos backend with an unconfirmed directive).
+
+    v3.5.2 - serialised by _AUTH_DIRECTIVE_LOCK so the background startup pass
+    (_apply_auth_directives_async) and a concurrent shim_reload reprobe never
+    interleave writes to the same Backend objects. block=False (shim_reload)
+    skips the reprobe when the startup pass still holds the lock instead of
+    waiting on it - that wait could be an up-to-120s interactive sign-in.
+    """
+    if not _AUTH_DIRECTIVE_LOCK.acquire(blocking=block):
+        _log_event("oidc_preflight_busy", level=logging.INFO)
         return backends
-    for b in backends:
-        # Only humans (negotiate) are candidates; x-punch-auth service backends stay put.
-        if b.auth != "negotiate":
-            continue
-        # Reset to base state EVERY pass (this runs again on shim_reload, over
-        # the SAME Backend objects). Without this, a directive that reverts
-        # oidc->kerberos would leave a stale effective_auth="oidc" (or a stale
-        # _fell_back=True) from a prior pass, since the `directive != "oidc"`
-        # continue below never reaches the assignment that would clear it.
-        b.effective_auth = b.auth   # negotiate
-        b._oidc_upn = ""
-        b._fell_back = False
-        directive = _query_auth_mode(b.url, upn)
-        if directive != "oidc":
-            continue
-        try:
-            # Silent first; interactive allowed once (first activation). Bounded.
-            # Broad except: this is a startup/reprobe decision path and must
-            # NEVER crash the shim (it runs at module import), no matter what
-            # the OIDC path raises — network errors, or anything else.
-            _oidc_acquire_token(upn, allow_interactive=True)
-            b.effective_auth = "oidc"
-            b._oidc_upn = upn
+    try:
+        upn = _local_windows_upn()
+        if not upn:
+            _log_event("oidc_no_local_upn", level=logging.INFO)
+            return backends
+        for b in backends:
+            # Only humans (negotiate) are candidates; x-punch-auth service backends stay put.
+            if b.auth != "negotiate":
+                continue
+            # Reset to base state EVERY pass (this runs again on shim_reload, over
+            # the SAME Backend objects). Without this, a directive that reverts
+            # oidc->kerberos would leave a stale effective_auth="oidc" (or a stale
+            # _fell_back=True) from a prior pass, since the `directive != "oidc"`
+            # continue below never reaches the assignment that would clear it.
+            b.effective_auth = b.auth   # negotiate
+            b._oidc_upn = ""
             b._fell_back = False
-            _log_event("oidc_cutover_confirmed", backend=b.name, upn=upn)
-        except Exception as e:
-            b.effective_auth = "negotiate"     # fail-safe: stay on Kerberos this session
-            b._fell_back = True
-            _log_event("oidc_fallback_to_negotiate", level=logging.WARNING,
-                       backend=b.name, upn=upn, error=str(e))
-    return backends
+            directive = _query_auth_mode(b.url, upn)
+            if directive != "oidc":
+                continue
+            try:
+                # Silent first; interactive allowed once (first activation). Bounded.
+                # Broad except: this runs on a daemon thread at startup and must
+                # NEVER crash the shim, no matter what the OIDC path raises.
+                _oidc_acquire_token(upn, allow_interactive=allow_interactive)
+                # Publish _oidc_upn BEFORE flipping effective_auth. A request on
+                # another thread reads effective_auth (http_client picks the auth
+                # mode) and then _oidc_upn (OidcAuth). Writing the upn first means
+                # a reader that sees "oidc" always sees a non-empty upn, never
+                # OidcAuth(""); effective_auth is the last write = the publish.
+                b._oidc_upn = upn
+                b._fell_back = False
+                b.effective_auth = "oidc"
+                _log_event("oidc_cutover_confirmed", backend=b.name, upn=upn)
+            except Exception as e:
+                b.effective_auth = "negotiate"     # fail-safe: stay on Kerberos this session
+                b._fell_back = True
+                _log_event("oidc_fallback_to_negotiate", level=logging.WARNING,
+                           backend=b.name, upn=upn, error=str(e))
+        return backends
+    finally:
+        _AUTH_DIRECTIVE_LOCK.release()
+
+
+def _apply_auth_directives_async(backends: list[Backend], *, block: bool = True,
+                                 allow_interactive: bool = True) -> threading.Thread | None:
+    """Run _apply_auth_directives on a daemon thread so shim STARTUP never blocks
+    on the /auth/mode probe, the OIDC token refresh, or (first activation) the
+    up-to-120s interactive browser sign-in.
+
+    Backends keep their configured `auth` (negotiate - a working credential)
+    until the directive resolves in the background, then flip to 'oidc' in place;
+    a request arriving during the window uses the working negotiate path. Returns
+    the started Thread (for callers/tests that want to join), or None when there
+    is no negotiate backend to resolve - so a service-only shim skips even the
+    whoami/UPN lookup.
+    """
+    if not any(b.auth == "negotiate" for b in backends):
+        return None
+
+    def _run() -> None:
+        try:
+            _apply_auth_directives(backends, block=block, allow_interactive=allow_interactive)
+        except Exception as e:   # a daemon thread must never die noisily
+            _log_event("oidc_preflight_thread_error", level=logging.WARNING, error=str(e))
+
+    t = threading.Thread(target=_run, name="punch-oidc-preflight", daemon=True)
+    t.start()
+    return t
 
 
 def _resolve_backends_path() -> Path:
@@ -1582,7 +1645,11 @@ def _discover_backends(backends: list[Backend]) -> list[Backend]:
 
 _BACKENDS, _PRIMARY = _load_backends()
 _BACKENDS = _discover_backends(_BACKENDS)
-_BACKENDS = _apply_auth_directives(_BACKENDS)
+# v3.5.2 - resolve OIDC directives on a background daemon thread so startup
+# reports ready immediately. Backends keep their working negotiate credential
+# until the directive resolves, then flip to oidc in place. The thread is kept
+# in a module global so it is not garbage-collected mid-resolution.
+_AUTH_PREFLIGHT_THREAD = _apply_auth_directives_async(_BACKENDS)
 
 
 # v2.3.1: prime the hot-reload mtime tracker so the FIRST throttle window
@@ -2555,9 +2622,13 @@ async def shim_reload(ctx: Context) -> str:
     try:
         r = _apply_catalogue_reload()
 
-        global _BACKENDS
-        _BACKENDS = _apply_auth_directives(_BACKENDS)
-        _log_event("oidc_reprobe", backend_names=[b.name for b in _BACKENDS])
+        # v3.5.2 - reprobe OIDC directives OFF the event loop (background daemon)
+        # and NON-interactively: a shim_reload must never block the conversation
+        # or pop a browser. block=False -> skip (don't wait) if the startup
+        # pre-flight still holds the lock; the interactive first-time sign-in
+        # happens only at startup. Mutates the _BACKENDS objects in place.
+        _apply_auth_directives_async(_BACKENDS, block=False, allow_interactive=False)
+        _log_event("oidc_reprobe_scheduled", backend_names=[b.name for b in _BACKENDS])
 
         if r["moved"]:
             await ctx.session.send_tool_list_changed()
