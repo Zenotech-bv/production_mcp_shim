@@ -273,7 +273,7 @@
     },
     {
       "name": "pa_extract_bsis",
-      "description": "Extract SAP BSIS (open G/L line items, keyed by HKONT) into pa_<user>.bsis (replace mode). bukrs required; hkont_in (human 411020 or padded 0000411020) restricts to specific G/L accounts. The G/L-account-keyed sibling of BSIK/BSID — feeds pa_gl_open_items / pa_gl_account_balance.",
+      "description": "Extract SAP BSIS (open G/L line items, keyed by HKONT) into pa_<user>.bsis (replace mode). bukrs required; hkont_in (human 411020 or padded 0000411020) restricts to specific G/L accounts; vbund_set=true pulls ONLY items WITH a trading partner (intercompany; pushed into the RFC read = far fewer rows), vbund_in specific partners. The G/L-account-keyed sibling of BSIK/BSID — feeds pa_gl_open_items / pa_gl_account_balance. GLG-2: PAGED by BUDAT date windows so a large CC stages COMPLETELY without the full-table scan that times out (a too-big window bisects by date — NEVER truncated). No budat_from defaults to ~20y..today (old open items aren't missed); pass budat_from to scope. result.coverage discloses the EXACT window staged (budat_from/to, windows, defaulted_from) — check it.",
       "inputSchema": {
         "additionalProperties": false,
         "description": "pa_extract_bsis — BSIS open G/L items, keyed by HKONT. The G/L-account\nanalogue of ExtractBsikArgs: `bukrs` required (large transactional table),\n`hkont_in` an optional G/L-account include list (human or padded form;\nthe WHERE-builder zero-pads to CHAR(10)). Open side -> lower-bound dates\nonly. Date filters ISO YYYY-MM-DD (CC-6).",
@@ -305,6 +305,26 @@
             "default": null,
             "title": "Hkont In"
           },
+          "vbund_set": {
+            "default": false,
+            "title": "Vbund Set",
+            "type": "boolean"
+          },
+          "vbund_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Vbund In"
+          },
           "bldat_from": {
             "default": "",
             "title": "Bldat From",
@@ -330,7 +350,7 @@
     },
     {
       "name": "pa_extract_bsas",
-      "description": "Extract SAP BSAS (cleared G/L line items, keyed by HKONT) into pa_<user>.bsas (replace mode). bukrs required; budat_from/budat_to bound the cleared history. Stage it alongside BSIS for the pa_gl_open_items as-at-key-date view (open at D = BSIS BUDAT<=D UNION BSAS BUDAT<=D AND AUGDT>D).",
+      "description": "Extract SAP BSAS (cleared G/L line items, keyed by HKONT) into pa_<user>.bsas (replace mode). bukrs required; budat_from/budat_to bound the cleared history; vbund_set=true / vbund_in push the trading-partner filter into the read (intercompany scope = far fewer rows). Stage it alongside BSIS for the pa_gl_open_items as-at-key-date view (open at D = BSIS BUDAT<=D UNION BSAS BUDAT<=D AND AUGDT>D). GLG-2: PAGED by BUDAT windows -> stages the COMPLETE range (too-big window bisects, never truncates). No budat_from defaults to ~20y..today; result.coverage discloses the exact window staged.",
       "inputSchema": {
         "additionalProperties": false,
         "description": "pa_extract_bsas — BSAS cleared G/L items, keyed by HKONT. The cleared-\nside mirror of ExtractBsisArgs: `bukrs` required, `budat_from`/`budat_to`\nbound the (potentially huge) cleared history. Stage it (alongside BSIS)\nfor the pa_gl_open_items as-at-key-date view. Date filters ISO YYYY-MM-DD.",
@@ -362,6 +382,26 @@
             "default": null,
             "title": "Hkont In"
           },
+          "vbund_set": {
+            "default": false,
+            "title": "Vbund Set",
+            "type": "boolean"
+          },
+          "vbund_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Vbund In"
+          },
           "budat_from": {
             "default": "",
             "title": "Budat From",
@@ -387,7 +427,7 @@
     },
     {
       "name": "pa_extract_bsis_group",
-      "description": "Extract SAP BSIS (open G/L) for MULTIPLE company codes (bukrs_in) into pa_<user>.bsis_grp (replace mode, bukrs-tagged) — the multi-CC staging pa_gl_group_overview needs, without clobbering the single-CC bsis. Refresh BROAD (pass every CC in one call), query narrow. hkont_in/bldat_from/budat_from scope the (large) pull. Each bukrs ACL-gated.",
+      "description": "Extract SAP BSIS (open G/L) for MULTIPLE company codes (bukrs_in) into pa_<user>.bsis_grp (replace mode, bukrs-tagged) — the multi-CC staging pa_gl_group_overview needs, without clobbering the single-CC bsis. Refresh BROAD (pass every CC in one call), query narrow. hkont_in/bldat_from/budat_from + vbund_set/vbund_in scope the (large) pull (vbund_set=true = intercompany items only, pushed into the read). Each bukrs ACL-gated. GLG-2: PAGED by BUDAT windows -> the multi-CC pull stages COMPLETELY without timing out (too-big window bisects, never truncates). No budat_from defaults to ~20y..today; result.coverage discloses the window.",
       "inputSchema": {
         "additionalProperties": false,
         "description": "pa_extract_bsis_group — stage BSIS (open G/L items) for MULTIPLE company\ncodes into pa_<user>.bsis_grp (bukrs-tagged), so pa_gl_group_overview works\nwithout the single-CC bsis clobber. Each bukrs is ACL-gated. Refresh BROAD\n(pass EVERY CC you want in ONE call — replace-mode rebuilds bsis_grp), query\nnarrow. hkont_in/date bounds keep the (large) pull scoped.",
@@ -414,6 +454,26 @@
             "default": null,
             "title": "Hkont In"
           },
+          "vbund_set": {
+            "default": false,
+            "title": "Vbund Set",
+            "type": "boolean"
+          },
+          "vbund_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Vbund In"
+          },
           "bldat_from": {
             "default": "",
             "title": "Bldat From",
@@ -439,7 +499,7 @@
     },
     {
       "name": "pa_extract_bsas_group",
-      "description": "BSAS (cleared G/L) group mirror of pa_extract_bsis_group -> pa_<user>.bsas_grp (multi-CC, bukrs-tagged). budat_from/budat_to bound the cleared history. Stage alongside bsis_grp for pa_gl_group_overview across company codes.",
+      "description": "BSAS (cleared G/L) group mirror of pa_extract_bsis_group -> pa_<user>.bsas_grp (multi-CC, bukrs-tagged). budat_from/budat_to bound the cleared history; vbund_set/vbund_in push the trading-partner filter into the read (intercompany scope). Stage alongside bsis_grp for pa_gl_group_overview across company codes. GLG-2: PAGED by BUDAT windows -> stages COMPLETELY (too-big window bisects, never truncates); result.coverage discloses the window.",
       "inputSchema": {
         "additionalProperties": false,
         "description": "pa_extract_bsas_group — BSAS (cleared G/L) group mirror of\nExtractBsisGroupArgs -> pa_<user>.bsas_grp. budat_from/budat_to bound the\n(potentially huge) cleared history. Refresh broad, query narrow.",
@@ -465,6 +525,26 @@
             ],
             "default": null,
             "title": "Hkont In"
+          },
+          "vbund_set": {
+            "default": false,
+            "title": "Vbund Set",
+            "type": "boolean"
+          },
+          "vbund_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Vbund In"
           },
           "budat_from": {
             "default": "",
@@ -1447,6 +1527,50 @@
           }
         },
         "title": "ExtractCskbArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_csks",
+      "description": "Extract SAP CSKS (cost-center master) into pa_<user>.csks (replace mode). One row per (KOKRS, KOSTL, DATBI): company code (BUKRS), category (KOSAR), profit center (PRCTR), responsible (VERAK), hierarchy area (KHINR). TIME-DEPENDENT (DATBI; current = 99991231). kokrs (controlling area, default 1000) scope. Stage with cskt for pa_cost_center_master (KOSTL -> name).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_csks -- CSKS (cost-center master). One row per\n(KOKRS, KOSTL, DATBI) carrying the cost center's company code (BUKRS),\ncategory (KOSAR), person responsible (VERAK), profit center (PRCTR),\ndepartment (ABTEI) and hierarchy area (KHINR). TIME-DEPENDENT by DATBI\n(current record = '99991231'). `kokrs` (default '1000') scopes the pull.\nSmall master-class table.",
+        "properties": {
+          "kokrs": {
+            "default": "1000",
+            "title": "Kokrs",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "title": "ExtractCsksArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_extract_cskt",
+      "description": "Extract SAP CSKT (cost-center texts) into pa_<user>.cskt (replace mode). One row per (KOKRS, KOSTL, DATBI, SPRAS): short (KTEXT) + long (LTEXT) description. TIME-DEPENDENT (DATBI; current = 99991231). kokrs (controlling area, default 1000) scope. Stage with csks for pa_cost_center_master (KOSTL -> name).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_extract_cskt -- CSKT (cost-center texts). One row per\n(KOKRS, KOSTL, DATBI, SPRAS) carrying the cost center's short (KTEXT) and\nlong (LTEXT) description in a language. TIME-DEPENDENT by DATBI (current\ntext = '99991231'). `kokrs` (default '1000') scopes the pull. Stage\nalongside pa_extract_csks so pa_cost_center_master can resolve names.",
+        "properties": {
+          "kokrs": {
+            "default": "1000",
+            "title": "Kokrs",
+            "type": "string"
+          },
+          "max_rows": {
+            "default": 0,
+            "title": "Max Rows",
+            "type": "integer"
+          }
+        },
+        "title": "ExtractCsktArgs",
         "type": "object"
       }
     },
@@ -5289,7 +5413,7 @@
       "description": "List staged EKKO purchase-order headers, LFA1 name-overlaid when staged. Filter by company code / vendor / PO / date. SAP equivalent: ME2N / ME23N.",
       "inputSchema": {
         "additionalProperties": false,
-        "description": "pa_purchase_orders — EKKO headers, optional LFA1 name overlay.\n\nPA-V2-SD-001: defaults to the PO order BOOK (BSTYP via\npa_common.po_order_book_bstyps() — F purchase orders + L scheduling\nagreements); RFQs and contracts are excluded so an RFQ/contract is never\nreturned as a purchase order. include_rfq adds BSTYP=A (RFQs);\ninclude_contracts adds BSTYP=K (contracts).",
+        "description": "pa_purchase_orders — EKKO headers, optional LFA1 name overlay.\n\nPA-V2-SD-001: defaults to the PO order BOOK (BSTYP via\npa_common.po_order_book_bstyps() — F purchase orders + L scheduling\nagreements); RFQs and contracts are excluded so an RFQ/contract is never\nreturned as a purchase order. include_rfq adds BSTYP=A (RFQs);\ninclude_contracts adds BSTYP=K (contracts). exclude_scheduling_agreements\ndrops BSTYP=L scheduling agreements (standard POs only).",
         "properties": {
           "top_n": {
             "default": 0,
@@ -5354,6 +5478,11 @@
             "default": false,
             "title": "Include Contracts",
             "type": "boolean"
+          },
+          "exclude_scheduling_agreements": {
+            "default": false,
+            "title": "Exclude Scheduling Agreements",
+            "type": "boolean"
           }
         },
         "title": "PurchaseOrdersArgs",
@@ -5365,7 +5494,7 @@
       "description": "PO lines with the EKPO/EKKO/EKBE residual (NETWR minus the EKBE invoice-receipt sum — CC-10). only_uninvoiced keeps lines with a non-zero residual. Default `top_n=100`; pass `top_n` to widen. SAP equivalent: ME2L / ME2M / ME2N (open-PO list by vendor / material / PO).",
       "inputSchema": {
         "additionalProperties": false,
-        "description": "pa_open_purchase_orders — PO lines with the EKPO/EKKO/EKBE residual\ncomputation (CC-10). only_uninvoiced (default true) keeps lines with a\nnon-zero residual beyond tolerance_pct; mode picks the residual basis.\n\nPA-V2-SD-001: by default the result is the PO order BOOK — BSTYP restricted\nto pa_common.po_order_book_bstyps() (F purchase orders + L scheduling\nagreements), so RFQs / contracts are never reported as open POs. include_rfq\nadds BSTYP=A; include_contracts adds BSTYP=K.",
+        "description": "pa_open_purchase_orders — PO lines with the EKPO/EKKO/EKBE residual\ncomputation (CC-10). only_uninvoiced (default true) keeps lines with a\nnon-zero residual beyond tolerance_pct; mode picks the residual basis.\nonly_uninvoiced (default true) also excludes SAP-closed lines\n(EKPO.ELIKZ='X' delivery-complete OR EKPO.EREKZ='X' final-invoice);\ninclude_delivery_complete=True keeps delivery-complete-but-not-yet-invoiced\nlines (AP-accrual view).\n\nPA-V2-SD-001: by default the result is the PO order BOOK — BSTYP restricted\nto pa_common.po_order_book_bstyps() (F purchase orders + L scheduling\nagreements), so RFQs / contracts are never reported as open POs. include_rfq\nadds BSTYP=A; include_contracts adds BSTYP=K. exclude_scheduling_agreements\ndrops BSTYP=L scheduling agreements (standard POs only).",
         "properties": {
           "top_n": {
             "default": 0,
@@ -5424,6 +5553,11 @@
           "only_uninvoiced": {
             "default": true,
             "title": "Only Uninvoiced",
+            "type": "boolean"
+          },
+          "include_delivery_complete": {
+            "default": false,
+            "title": "Include Delivery Complete",
             "type": "boolean"
           },
           "tolerance_pct": {
@@ -5449,6 +5583,11 @@
             "default": false,
             "title": "Include Contracts",
             "type": "boolean"
+          },
+          "exclude_scheduling_agreements": {
+            "default": false,
+            "title": "Exclude Scheduling Agreements",
+            "type": "boolean"
           }
         },
         "title": "OpenPurchaseOrdersArgs",
@@ -5460,7 +5599,7 @@
       "description": "Per-currency PO value + residual roll-up (same EKBE residual computation as pa_open_purchase_orders — CC-10).",
       "inputSchema": {
         "additionalProperties": false,
-        "description": "pa_po_value_summary — the residual computation rolled up per currency.\n\nPA-V2-SD-001: order book only (BSTYP F purchase orders + L scheduling\nagreements via pa_common.po_order_book_bstyps()); RFQs / contracts do not\ninflate the PO value. include_rfq adds BSTYP=A; include_contracts adds\nBSTYP=K.",
+        "description": "pa_po_value_summary — the residual computation rolled up per currency.\nonly_uninvoiced (default true) also excludes SAP-closed lines\n(EKPO.ELIKZ='X' delivery-complete OR EKPO.EREKZ='X' final-invoice);\ninclude_delivery_complete=True keeps delivery-complete-but-not-yet-invoiced\nlines (AP-accrual view).\n\nPA-V2-SD-001: order book only (BSTYP F purchase orders + L scheduling\nagreements via pa_common.po_order_book_bstyps()); RFQs / contracts do not\ninflate the PO value. include_rfq adds BSTYP=A; include_contracts adds\nBSTYP=K. exclude_scheduling_agreements drops BSTYP=L scheduling agreements\n(standard POs only).",
         "properties": {
           "bukrs": {
             "default": "",
@@ -5487,6 +5626,11 @@
             "title": "Only Uninvoiced",
             "type": "boolean"
           },
+          "include_delivery_complete": {
+            "default": false,
+            "title": "Include Delivery Complete",
+            "type": "boolean"
+          },
           "mode": {
             "default": "residual_corrected",
             "enum": [
@@ -5505,9 +5649,73 @@
             "default": false,
             "title": "Include Contracts",
             "type": "boolean"
+          },
+          "exclude_scheduling_agreements": {
+            "default": false,
+            "title": "Exclude Scheduling Agreements",
+            "type": "boolean"
           }
         },
         "title": "PoValueSummaryArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_total_liability",
+      "description": "Combined OPEN LIABILITY (Open PR + Open PO + Open Invoices) for ONE company code, EUR, signed NEGATIVE (money owed out) — the server-side 'Total Liability' KPI (one call replaces the client-side ~15-call daily orchestration). COMPOSES the canonical open-item logic of each leg: Open Invoices from BSIK in BOOKED EUR via DMBTR (company-code currency, ties to the GL/FBL1N — NOT a spot-FX of the document amount), SHKZG-signed; Open PO = sum(open_commitment_value) per currency (EREKZ/ELIKZ closed-line gating; exclude_scheduling_agreements default true, include_delivery_complete passthrough); Open PR = MENGE*PREIS/PEINH over open reqs (EBELN=''/LOEKZ=''/EBAKZ<>'X'). SCOPE IS HETEROGENEOUS and disclosed: PR is PLANT-scoped (EBAN has no BUKRS; use werks), Invoices are the whole company code (BSIK has no WERKS). CURRENCY-NATIVE: PR/PO foreign-currency lines are reported separately, NOT in total_liability_eur (convert at a stated indicative rate downstream). exclude_vendors is reported gross->excluded->net (never silently folded); exclude_intercompany default true. bsik REQUIRED (I-15 wrong-CC guard); ekko/ekpo/ekbe + eban detect-and-degrade. SAP equivalent: ME2L/ME5A + FBL1N.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_total_liability — the combined open liability (Open PR + Open PO +\nOpen Invoices) for ONE company code, EUR, signed NEGATIVE (money owed out).\nThe server-side replacement for the client-side daily 'Total Liability' KPI.\n\nReuses the canonical open-item logic of each leg (never re-derived):\n  * Open Invoices (BSIK) — booked EUR via **DMBTR** (company-code currency,\n    ties to the GL / FBL1N), NOT a spot-FX of the document amount; SHKZG-\n    signed so a genuine payable is negative. `exclude_intercompany` (default\n    True) drops IC vendors via the shared registry.\n  * Open PO (EKKO/EKPO/EKBE) — sum(open_commitment_value) per currency;\n    `exclude_scheduling_agreements` (default True, BSTYP<>'L') and\n    `include_delivery_complete` (default False, ELIKZ) passed through.\n  * Open PR (EBAN) — MENGE*PREIS/PEINH over open reqs (EBELN=''/LOEKZ=''/\n    EBAKZ<>'X'). EBAN has no BUKRS — it is PLANT-scoped, so PR is disclosed\n    as plant-scoped (use `werks`), not company-code-attributable.\n\n`bukrs` (required) scopes PO + invoices. `werks` (optional) filters PR + PO\nto one plant (invoices cannot be plant-filtered — BSIK has no WERKS — so the\ninvoice leg is the whole company code; the mixed scope is disclosed).\n`exclude_vendors` is a lifnr list excluded from every leg and reported as a\ngross->excluded->net reconciling amount (never silently folded). `as_of`\n(ISO) effective-dates the intercompany exclusion.\n\nCurrency-native: PR/PO foreign-currency lines are reported separately (NOT\nin total_liability_eur), to be converted at a stated indicative rate if a\nsingle blended figure is wanted. Invoices are already EUR (DMBTR). Returns a\nscalar summary dict (like pa_po_value_summary), NOT a table handle.",
+        "properties": {
+          "bukrs": {
+            "title": "Bukrs",
+            "type": "string"
+          },
+          "werks": {
+            "default": "",
+            "title": "Werks",
+            "type": "string"
+          },
+          "exclude_vendors": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Exclude Vendors"
+          },
+          "exclude_scheduling_agreements": {
+            "default": true,
+            "title": "Exclude Scheduling Agreements",
+            "type": "boolean"
+          },
+          "include_delivery_complete": {
+            "default": false,
+            "title": "Include Delivery Complete",
+            "type": "boolean"
+          },
+          "exclude_intercompany": {
+            "default": true,
+            "title": "Exclude Intercompany",
+            "type": "boolean"
+          },
+          "banfn_prefix": {
+            "default": "",
+            "title": "Banfn Prefix",
+            "type": "string"
+          }
+        },
+        "required": [
+          "bukrs"
+        ],
+        "title": "TotalLiabilityArgs",
         "type": "object"
       }
     },
@@ -6677,6 +6885,254 @@
           "group_account"
         ],
         "title": "GlGroupOverviewArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_gl_account_master",
+      "description": "G/L account master (SKA1 + SKAT) as a JOINABLE intermediate: one row per (KTOPL, SAKNR) with hkont (= SAKNR, the join key on BSIS/BSAS), account_text (SKAT TXT50 over TXT20), account_group (SKA1.KTOKS), group_account (SKA1.BILKT), and account_type (SKA1.XBILK: 'X'=balance_sheet, ''=P&L). Join to a G/L handle (pa_gl_open_items / pa_gl_account_balance) via pa_table_join ON hkont for account NAMES + a B/S-vs-P&L split. Filters: ktopl (chart), saknr_in, bilkt (group account), account_type, spras (text language, default 'E'). Requires pa_extract_ska1; skat optional (names degrade to blank). Returns a table handle; default top_n=100. SAP equivalent: FS00 / FSP0.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_gl_account_master — the G/L account master (SKA1 + SKAT) as a joinable\nintermediate: one row per (KTOPL, SAKNR) with HKONT (= SAKNR, the join key on\nBSIS/BSAS), account name (SKAT TXT50 over TXT20), account group (SKA1.KTOKS),\ngroup account (SKA1.BILKT), and the balance-sheet-vs-P&L flag from SKA1.XBILK.\nRow-shaped (TableHandleResult) — join to a G/L handle (pa_gl_open_items /\npa_gl_account_balance) via pa_table_join ON hkont for account names + a\nB/S-vs-P&L split.\n\nFilters: `ktopl` (chart of accounts, e.g. 'YCBE'); `saknr_in` (specific G/L\naccounts); `bilkt` (one group account); `account_type` ('balance_sheet' | 'pl'\nfrom XBILK — needs a SKA1 re-extracted at v0.1.53+, else a clear error).\n`spras` is the SKAT text language (default 'E'). Requires pa_extract_ska1;\nSKAT optional (account_text degrades to blank, disclosed in methodology).",
+        "properties": {
+          "top_n": {
+            "default": 0,
+            "title": "Top N",
+            "type": "integer"
+          },
+          "sort_by": {
+            "default": "",
+            "title": "Sort By",
+            "type": "string"
+          },
+          "sort_order": {
+            "default": "desc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "type": "string"
+          },
+          "page_size": {
+            "default": 0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "cursor": {
+            "default": "",
+            "title": "Cursor",
+            "type": "string"
+          },
+          "ktopl": {
+            "default": "",
+            "title": "Ktopl",
+            "type": "string"
+          },
+          "saknr_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Saknr In"
+          },
+          "bilkt": {
+            "default": "",
+            "title": "Bilkt",
+            "type": "string"
+          },
+          "account_type": {
+            "default": "",
+            "enum": [
+              "",
+              "balance_sheet",
+              "pl"
+            ],
+            "title": "Account Type",
+            "type": "string"
+          },
+          "spras": {
+            "default": "E",
+            "title": "Spras",
+            "type": "string"
+          }
+        },
+        "title": "GlAccountMasterArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_cost_center_master",
+      "description": "Cost-center master (KOSTL name + company code + profit center + category), joinable on kostl. SAP KS03. Stage with pa_extract_csks (+ pa_extract_cskt for names).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_cost_center_master — the cost-center master (CSKS + CSKT) as a joinable\nintermediate: one row per current KOSTL with cost_center_name (CSKT KTEXT\nover LTEXT), company code (BUKRS), category (KOSAR), profit center (PRCTR),\nperson responsible (VERAK) and hierarchy area (KHINR). Row-shaped\n(TableHandleResult) — join to a handle carrying KOSTL (COEP / project\npostings) via pa_table_join ON kostl for cost-center names + company-code /\nprofit-center context.\n\nCURRENT SLICE: only the currently-valid CSKS record (DATBI = 99991231) is\nreturned; superseded historical intervals are excluded.\n\nFilters: `kokrs` (controlling area, default '1000'); `kostl_in` (specific\ncost centers); `bukrs` (one company code); `prctr` (one profit center).\n`spras` is the CSKT text language (default 'E'). Requires pa_extract_csks;\nCSKT optional (cost_center_name degrades to blank, disclosed in\nmethodology).",
+        "properties": {
+          "top_n": {
+            "default": 0,
+            "title": "Top N",
+            "type": "integer"
+          },
+          "sort_by": {
+            "default": "",
+            "title": "Sort By",
+            "type": "string"
+          },
+          "sort_order": {
+            "default": "desc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "type": "string"
+          },
+          "page_size": {
+            "default": 0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "cursor": {
+            "default": "",
+            "title": "Cursor",
+            "type": "string"
+          },
+          "kokrs": {
+            "default": "1000",
+            "title": "Kokrs",
+            "type": "string"
+          },
+          "kostl_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Kostl In"
+          },
+          "bukrs": {
+            "default": "",
+            "title": "Bukrs",
+            "type": "string"
+          },
+          "prctr": {
+            "default": "",
+            "title": "Prctr",
+            "type": "string"
+          },
+          "spras": {
+            "default": "E",
+            "title": "Spras",
+            "type": "string"
+          }
+        },
+        "title": "CostCenterMasterArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_cost_center_actuals",
+      "description": "Spend-by-cost-element (G/L account) breakdown for a COST CENTRE from CO actual postings. Answers 'what did IT cost centre 0100012000 spend, by G/L account?'. Resolves the cost centre to its CO object number KS<kokrs><kostl> (current-slice CSKS) and sums COEP WRTTP='04' actuals grouped by KSTAR (= G/L account), named via SKAT (TXT50 over TXT20; NOT CSKT, which names the cost centre) and classified revenue/cost by CSKB.KATYP (11/12 = revenue, else cost). SIGNED NETTING (not abs): total_cost = SUM(WKGBTR) over cost elements (credits net against debits); total_revenue = -SUM(WKGBTR) over revenue elements; net = -SUM(WKGBTR), reconciling to SAP CJI3 / S_ALR_87013542 — CO-area currency (WKGBTR). group_by = kstar (default, spend by G/L account) / kstar_gjahr / gjahr / perio; kostl or kostl_in required; gjahr_from/gjahr_to bound the fiscal-year window. Returns the scalar figures (total_cost/total_revenue/net/line_count, min/max_gjahr, currency) + by-year + a detail handle. csks + coep required (coep must hold the cost centre's objnrs, else a missing_extract with the exact objnr_in hint); cskb/skat/cskt optional (degrade disclosed). A non-existent cost centre returns found=False (not a crash). SAP equivalent: CJI3 / S_ALR_87013542 (All Cost Elements / Actual).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_cost_center_actuals — spend-by-cost-element (G/L account) breakdown for\na cost centre from CO actual line items (SAP equivalent: CJI3 /\nS_ALR_87013542, 'All Cost Elements / Actual', scoped to a cost centre).\n\n`kostl` is the cost centre (CSKS KOSTL); pass the padded or unpadded form\n('0100012000' or '100012000') — it is zero-padded to the 10-char CSKS width\nand resolved against the current-slice CSKS (DATBI = 99991231). `kostl_in`\nextends the scope to several cost centres (the breakdown then aggregates\nacross them). At least one of `kostl` / `kostl_in` is required. `kokrs`\n(controlling area, default '1000') builds the CO object number\nKS<kokrs><kostl> and scopes the COEP read. `gjahr_from` / `gjahr_to`\n(\"YYYY\"; \"\" = open) bound the fiscal-year window. `wrttp` is the CO value\ntype (default '04' = actuals). `group_by` sets the detail-handle grain:\n'kstar' (default — one row per cost element = G/L account, THE deliverable),\n'kstar_gjahr', 'gjahr' or 'perio'. `spras` is the SKAT/CSKT text language\n(default 'E').\n\nBaseListArgs (NOT _StrictBase): the shim auto-injects page_size/cursor on\nevery list-shaped tool (v0.1.1 lesson).",
+        "properties": {
+          "top_n": {
+            "default": 0,
+            "title": "Top N",
+            "type": "integer"
+          },
+          "sort_by": {
+            "default": "",
+            "title": "Sort By",
+            "type": "string"
+          },
+          "sort_order": {
+            "default": "desc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "title": "Sort Order",
+            "type": "string"
+          },
+          "page_size": {
+            "default": 0,
+            "title": "Page Size",
+            "type": "integer"
+          },
+          "cursor": {
+            "default": "",
+            "title": "Cursor",
+            "type": "string"
+          },
+          "kostl": {
+            "default": "",
+            "title": "Kostl",
+            "type": "string"
+          },
+          "kostl_in": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Kostl In"
+          },
+          "kokrs": {
+            "default": "1000",
+            "title": "Kokrs",
+            "type": "string"
+          },
+          "gjahr_from": {
+            "default": "",
+            "title": "Gjahr From",
+            "type": "string"
+          },
+          "gjahr_to": {
+            "default": "",
+            "title": "Gjahr To",
+            "type": "string"
+          },
+          "wrttp": {
+            "default": "04",
+            "title": "Wrttp",
+            "type": "string"
+          },
+          "group_by": {
+            "default": "kstar",
+            "title": "Group By",
+            "type": "string"
+          },
+          "spras": {
+            "default": "E",
+            "title": "Spras",
+            "type": "string"
+          }
+        },
+        "title": "CostCenterActualsArgs",
         "type": "object"
       }
     },
@@ -9003,7 +9459,7 @@
       "description": "Stream a handle's underlying table to an .xlsx file on the substrate host and return a download URL. Files live 7 days (configurable via PA_FILE_TTL_DAYS). Optional `filename` is sanitised + prepended as an analyst label to the system-generated tail (tool_YYYYMMDD_HHMMSS_<hash>.xlsx). openpyxl write_only mode + server-side cursor stream rows so wide / tall tables don't load fully in memory. Download requires the same X-Punch-Auth key as /tools and re-checks ownership against pa_common.file_registry. Spec: docs/v2-companion-tools.md §3.4.",
       "inputSchema": {
         "additionalProperties": false,
-        "description": "pa_table_to_xlsx — stream a handle's underlying table to an .xlsx\nfile on the substrate host and return a download URL.\n\nFiles live 7 days by default (configurable via PA_FILE_TTL_DAYS). The\ndownload URL is /files/<filename> — same-host auth required.\n\n`filename` is an OPTIONAL analyst-supplied prefix that gets sanitised\nand prepended to the system-generated tail (which carries the tool\nname + timestamp + args-hash for collision resistance). If you don't\nset it, the filename is fully system-generated. Spec:\ndocs/v2-companion-tools.md §3.4.",
+        "description": "pa_table_to_xlsx — stream a handle's underlying table to an .xlsx\nfile on the substrate host and return its path + download URL.\n\nFiles live 7 days by default (configurable via PA_FILE_TTL_DAYS). The\nresult carries BOTH `local_path` (the on-disk path,\nC:\\Claude\\punch_analytics_files\\<user>\\<file>.xlsx) and `download_url`\n(/files/<filename>, same-host auth). The WHOLE file is written server-side,\nso a caller co-located with the host should READ `local_path` DIRECTLY with\nits file tools — O(1) model tokens for any size; never paginate the rows\nback through the model. Off-host callers use download_url.\n\n`filename` is an OPTIONAL analyst-supplied prefix that gets sanitised\nand prepended to the system-generated tail (which carries the tool\nname + timestamp + args-hash for collision resistance). If you don't\nset it, the filename is fully system-generated. Spec:\ndocs/v2-companion-tools.md §3.4.",
         "properties": {
           "handle": {
             "title": "Handle",
@@ -9034,6 +9490,35 @@
           "handle"
         ],
         "title": "TableToXlsxArgs",
+        "type": "object"
+      }
+    },
+    {
+      "name": "pa_table_to_csv",
+      "description": "Stream a handle's underlying table to a UTF-8 .csv file on the substrate host and return local_path + download URL. The lighter CSV sibling of pa_table_to_xlsx (no sheet / freeze semantics) — better for very large pulls and trivially re-ingestible. RFC-4180 quoting; money / dates keep exact text form (no float coercion). Files live 7 days (PA_FILE_TTL_DAYS). Optional `filename` is sanitised + prepended as an analyst label to the system-generated tail (tool_YYYYMMDD_HHMMSS_<hash>.csv). csv.writer + server-side cursor stream rows so tall tables don't load fully in memory. Download requires the same X-Punch-Auth key as /tools and re-checks ownership against pa_common.file_registry. Spec: docs/v2-companion-tools.md §3.4.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "description": "pa_table_to_csv — stream a handle's underlying table to a UTF-8 .csv\nfile on the substrate host and return its path + download URL.\n\nThe CSV sibling of pa_table_to_xlsx: lighter than xlsx for very large\npulls and trivially re-ingestible by other tools, with no sheet / freeze\nsemantics. RFC-4180 quoting via the stdlib csv writer; money and dates\nkeep their exact text form (no float coercion). Files live 7 days by\ndefault (configurable via PA_FILE_TTL_DAYS). The result carries BOTH\n`local_path` (the on-disk path,\nC:\\Claude\\punch_analytics_files\\<user>\\<file>.csv) and `download_url`\n(/files/<filename>, same-host auth). The WHOLE file is written\nserver-side, so a caller co-located with the host should READ\n`local_path` DIRECTLY with its file tools — O(1) model tokens for any\nsize; never paginate the rows back through the model. Off-host callers\nuse download_url.\n\n`filename` is an OPTIONAL analyst-supplied prefix that gets sanitised\nand prepended to the system-generated tail (tool name + timestamp +\nargs-hash for collision resistance). Spec: docs/v2-companion-tools.md\n§3.4.",
+        "properties": {
+          "handle": {
+            "title": "Handle",
+            "type": "string"
+          },
+          "filename": {
+            "default": "",
+            "title": "Filename",
+            "type": "string"
+          },
+          "include_header": {
+            "default": true,
+            "title": "Include Header",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "handle"
+        ],
+        "title": "TableToCsvArgs",
         "type": "object"
       }
     },
@@ -9415,7 +9900,7 @@
       }
     }
   ],
-  "count": 217,
-  "server_version": "0.1.44",
-  "generated_from": "pa_v2 dispatcher.list_tools_for_user(full_access=False) — offline-fallback snapshot @ v0.1.44"
+  "count": 224,
+  "server_version": "0.1.66",
+  "generated_from": "pa_v2 dispatcher.list_tools_for_user(full_access=False) — offline-fallback snapshot @ v0.1.66"
 }
