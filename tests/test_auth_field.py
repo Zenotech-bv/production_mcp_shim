@@ -43,14 +43,30 @@ def test_backend_auth_defaults_to_x_punch_auth():
     assert b.auth == "x-punch-auth"
 
 
-def test_backend_unknown_auth_falls_back_safely():
+def test_backend_unknown_auth_falls_back_to_negotiate():
     shim = _import_shim()
-    b = shim.Backend(name="sap", url="http://x:1", header="X-A",
-                     key="K-padded-to-pass-placeholder-guard",
-                     auth="kerberos-but-not-quite")
-    # Unknown mode is logged and reverted to the safe default so the shim
-    # doesn't crash on a typo'd config.
-    assert b.auth == "x-punch-auth"
+    b = shim.Backend(name="sap", url="http://mcp.example.com:3000", header="X-A",
+                     key="", auth="kerberos-but-not-quite")
+    # Unknown mode reverts to the SAFE HUMAN default (negotiate), not x-punch-auth
+    # (a human row has no key; x-punch-auth would be a silent auth-strip).
+    assert b.auth == "negotiate"
+
+
+def test_effective_auth_oidc_attaches_oidc_auth():
+    shim = _import_shim()
+    b = shim.Backend(name="sap", url="http://mcp.example.com:3000",
+                     header="X-Punch-Auth", key="", auth="negotiate")
+    b.effective_auth = "oidc"
+    b._oidc_upn = "alice@punchpowertrain.com"
+    with b.http_client() as c:
+        assert isinstance(c.auth, shim.OidcAuth)
+        assert "X-Punch-Auth" not in c.headers
+
+
+def test_oidc_backend_is_configured_without_key():
+    shim = _import_shim()
+    b = shim.Backend(name="sap", url="http://x:3000", header="X-A", key="", auth="oidc")
+    assert b.is_configured is True
 
 
 def test_backend_auth_is_normalised_to_lowercase():

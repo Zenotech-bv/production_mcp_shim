@@ -193,7 +193,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # launch, so the env converges with no per-laptop action. Best-effort +
 # idempotent; never blocks startup. Logic change, but no behaviour change for
 # an already-fixed (v3.4.3+) manifest — it's a no-op there.
-_SHIM_VERSION = "3.4.6"
+_SHIM_VERSION = "3.5.0"
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +401,7 @@ def _log_event(event: str, level: int = logging.INFO, **fields):
 # ---------------------------------------------------------------------------
 
 
-_VALID_AUTH_MODES = ("x-punch-auth", "negotiate")
+_VALID_AUTH_MODES = ("x-punch-auth", "negotiate", "oidc")
 
 
 class NegotiateAuth(httpx.Auth):
@@ -441,6 +441,335 @@ class NegotiateAuth(httpx.Auth):
             response = yield request
 
 
+_OIDC_TENANT    = "1c517a07-0e28-4923-a932-cace3138e782"
+_OIDC_CLIENT_ID = "71b30538-8e08-47c6-ab2e-1ca23ce68488"
+_OIDC_SCOPE     = "api://a23d5e91-7dd8-4544-8a04-a471bb731406/access_as_user offline_access openid"
+_OIDC_AUTHORIZE = f"https://login.microsoftonline.com/{_OIDC_TENANT}/oauth2/v2.0/authorize"
+_OIDC_TOKEN     = f"https://login.microsoftonline.com/{_OIDC_TENANT}/oauth2/v2.0/token"
+_OIDC_HTTP_TIMEOUT = 20.0
+_OIDC_INTERACTIVE_TIMEOUT = 120.0  # bounded browser sign-in wait
+
+
+class OidcError(Exception):
+    """OIDC token acquisition failed (network, user cancel, bad state, etc.)."""
+
+
+def _pkce_pair() -> tuple[str, str]:
+    import secrets, hashlib, base64  # lazy: OIDC-only
+    verifier = secrets.token_urlsafe(64)[:128]
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode("ascii")).digest()
+    ).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def _loopback_serve_once(port_holder: dict, timeout: float) -> dict:
+    """Bind an http.server on 127.0.0.1:0, put the chosen port in port_holder,
+    serve exactly ONE request, and return the parsed query {code,state} (or
+    {error:...}). Lazy-imports http.server. 127.0.0.1 only; shut down after one hit."""
+    import http.server, urllib.parse  # lazy: OIDC-only
+    result: dict = {}
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            q = urllib.parse.urlparse(self.path).query
+            result.update({k: v[0] for k, v in urllib.parse.parse_qs(q).items()})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<html><body>Punch sign-in complete. You can close this tab.</body></html>")
+
+        def log_message(self, *a):  # silence
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    port_holder["port"] = srv.server_address[1]
+    srv.timeout = timeout
+    srv.handle_request()  # exactly one; blocks up to `timeout`
+    srv.server_close()
+    return result
+
+
+def _loopback_receive_code(*, state: str, timeout: float, login_hint: str = "") -> tuple[str, str, str, str]:
+    """Open the browser to the authorize URL and receive the code on a loopback
+    listener. Returns (code, redirect_uri, code_verifier, nonce). Raises OidcError
+    on timeout / user cancel / state mismatch. Binds 127.0.0.1 on an ephemeral port
+    (via _loopback_serve_once, in a daemon thread) and serves exactly one request."""
+    import webbrowser, secrets, threading, time  # lazy: OIDC-only
+    from urllib.parse import urlencode           # lazy: OIDC-only
+
+    verifier, challenge = _pkce_pair()
+    nonce = secrets.token_urlsafe(24)
+    holder: dict = {}     # the server thread sets holder["port"] once bound
+    captured: dict = {}   # the single callback's {code,state,error}
+
+    def _serve():
+        captured.update(_loopback_serve_once(holder, timeout))
+
+    t = threading.Thread(target=_serve, daemon=True)
+    t.start()
+    for _ in range(200):          # wait up to ~2s for the ephemeral port to bind
+        if "port" in holder or not t.is_alive():
+            # Either the real listener bound (holder["port"] set), or the
+            # server thread already finished — e.g. a test double for
+            # _loopback_serve_once that returns immediately without ever
+            # touching port_holder. Don't treat the latter as a bind failure;
+            # let the state/code checks below produce the right error.
+            break
+        time.sleep(0.01)
+    if "port" not in holder and t.is_alive():
+        raise OidcError("loopback listener did not bind")
+    redirect_uri = f"http://localhost:{holder['port']}" if "port" in holder else ""
+
+    params = {
+        "client_id": _OIDC_CLIENT_ID, "response_type": "code",
+        "redirect_uri": redirect_uri, "scope": _OIDC_SCOPE,
+        "code_challenge": challenge, "code_challenge_method": "S256",
+        "state": state, "nonce": nonce,
+    }
+    if login_hint:
+        params["login_hint"] = login_hint
+    webbrowser.open(_OIDC_AUTHORIZE + "?" + urlencode(params))
+
+    t.join(timeout + 5)
+    if not captured:
+        raise OidcError("sign-in timed out or was cancelled")
+    if captured.get("error"):
+        raise OidcError(f"authorize error: {captured.get('error')}")
+    if not secrets.compare_digest(captured.get("state") or "", state):
+        raise OidcError("state mismatch on loopback callback (rejected)")
+    code = captured.get("code")
+    if not code:
+        raise OidcError("no code on loopback callback")
+    return code, redirect_uri, verifier, nonce
+
+
+def _exchange_code(code: str, verifier: str, redirect_uri: str) -> dict:
+    data = {
+        "grant_type": "authorization_code", "client_id": _OIDC_CLIENT_ID,
+        "code": code, "redirect_uri": redirect_uri, "code_verifier": verifier,
+        "scope": _OIDC_SCOPE,
+    }
+    try:
+        r = httpx.post(_OIDC_TOKEN, data=data, timeout=_OIDC_HTTP_TIMEOUT)
+    except httpx.RequestError as e:
+        # DNS/VPN/timeout etc. — a network failure, not an HTTP error response.
+        # Must still surface as OidcError so callers (and _apply_auth_directives'
+        # narrower `except OidcError`, pre-Fix-1b) can catch it uniformly.
+        raise OidcError(f"token endpoint unreachable: {e}") from e
+    if r.status_code != 200:
+        raise OidcError(f"token exchange failed: {r.status_code} {r.text[:200]}")
+    data_out = r.json()
+    if not data_out.get("access_token"):
+        raise OidcError(f"token response missing access_token: {r.text[:200]}")
+    return data_out
+
+
+def _verify_id_token_nonce(toks: dict, expected_nonce: str) -> None:
+    """Bind the id_token (if present) to THIS request via its nonce claim
+    (token-replay/injection defense, design §2/§10). Signature isn't verified
+    client-side — the token came directly from Entra over TLS in the code
+    exchange, and the access token is pa_v2's actual trust anchor. If no
+    id_token is present, skip — don't fail (scope doesn't guarantee one)."""
+    id_token = toks.get("id_token")
+    if not id_token:
+        return
+    import jwt  # lazy: OIDC-only
+    import secrets  # lazy: OIDC-only (constant-time compare)
+    claims = jwt.decode(id_token, options={"verify_signature": False,
+                                            "verify_aud": False,
+                                            "verify_exp": False})
+    if not secrets.compare_digest(claims.get("nonce") or "", expected_nonce):
+        raise OidcError("id_token nonce mismatch")
+
+
+def _refresh_token(refresh_token: str) -> dict:
+    data = {
+        "grant_type": "refresh_token", "client_id": _OIDC_CLIENT_ID,
+        "refresh_token": refresh_token, "scope": _OIDC_SCOPE,
+    }
+    try:
+        r = httpx.post(_OIDC_TOKEN, data=data, timeout=_OIDC_HTTP_TIMEOUT)
+    except httpx.RequestError as e:
+        raise OidcError(f"token endpoint unreachable: {e}") from e
+    if r.status_code != 200:
+        raise OidcError(f"refresh failed: {r.status_code} {r.text[:200]}")
+    data_out = r.json()
+    if not data_out.get("access_token"):
+        raise OidcError(f"token response missing access_token: {r.text[:200]}")
+    return data_out
+
+
+def _oidc_cache_dir():
+    d = _resolve_log_dir() / "oidc"   # %LOCALAPPDATA%\PunchAnalytics\oidc (test-isolated)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _oidc_cache_path(upn: str):
+    import hashlib  # lazy
+    tag = hashlib.sha256(upn.lower().encode("utf-8")).hexdigest()[:16]
+    return _oidc_cache_dir() / f"tok_{tag}.bin"
+
+
+def _dpapi_available() -> bool:
+    try:
+        import win32crypt  # noqa: F401  (lazy)
+        return True
+    except Exception:
+        return False
+
+
+def _dpapi_protect(raw: bytes) -> bytes:
+    import win32crypt  # lazy
+    # user-scoped DPAPI (no LOCALMACHINE flag): file-copy/backup theft yields ciphertext.
+    return win32crypt.CryptProtectData(raw, "punch-oidc", None, None, None, 0)
+
+
+def _dpapi_unprotect(blob: bytes) -> bytes:
+    import win32crypt  # lazy
+    _desc, out = win32crypt.CryptUnprotectData(blob, None, None, None, 0)
+    return out
+
+
+def _token_cache_write(upn: str, tokens: dict) -> None:
+    import json, base64  # lazy: both are cheap stdlib, but kept out of module load with the rest of OIDC
+    payload = json.dumps(tokens).encode("utf-8")
+    path = _oidc_cache_path(upn)
+    try:
+        if _dpapi_available():
+            path.write_bytes(_dpapi_protect(payload))
+        else:
+            # plaintext fallback — still per-Windows-user isolated under LOCALAPPDATA.
+            path.write_bytes(b"PLAIN:" + base64.b64encode(payload))
+        try:
+            import os as _os
+            _os.chmod(path, 0o600)   # on Windows this only clears the read-only attribute bit,
+            # not owner/other perms; real isolation is NTFS ACLs inherited from the
+            # per-user %LOCALAPPDATA% dir, plus DPAPI. Harmless best-effort elsewhere.
+        except OSError:
+            pass
+    except OSError as e:
+        _log_event("oidc_cache_write_failed", level=logging.WARNING, error=str(e))
+
+
+def _token_cache_read(upn: str) -> dict | None:
+    import json, base64  # lazy
+    path = _oidc_cache_path(upn)
+    try:
+        blob = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        if blob.startswith(b"PLAIN:"):
+            raw = base64.b64decode(blob[len(b"PLAIN:"):])
+        else:
+            raw = _dpapi_unprotect(blob)
+        return json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        _log_event("oidc_cache_read_failed", level=logging.WARNING, error=str(e))
+        return None
+
+
+def _oidc_acquire_token(upn: str, *, allow_interactive: bool) -> str:
+    import time as _t, secrets  # lazy
+    cached = _token_cache_read(upn)
+    if cached:
+        if cached.get("access_token") and float(cached.get("expires_at", 0)) - 60 > _t.time():
+            return cached["access_token"]
+        if cached.get("refresh_token"):
+            try:
+                toks = _refresh_token(cached["refresh_token"])
+                _persist_tokens(upn, toks)
+                return toks["access_token"]
+            except OidcError as e:
+                _log_event("oidc_refresh_failed", level=logging.WARNING, error=str(e))
+                # fall through to interactive (if allowed)
+    if not allow_interactive:
+        raise OidcError("no usable OIDC token and interactive sign-in not allowed here")
+    state = secrets.token_urlsafe(24)
+    code, redirect_uri, verifier, nonce = _loopback_receive_code(
+        state=state, timeout=_OIDC_INTERACTIVE_TIMEOUT, login_hint=upn)
+    toks = _exchange_code(code, verifier, redirect_uri)
+    _verify_id_token_nonce(toks, nonce)
+    _persist_tokens(upn, toks)
+    return toks["access_token"]
+
+
+def _persist_tokens(upn: str, toks: dict) -> None:
+    import time as _t  # lazy
+    try:
+        exp = int(toks.get("expires_in", 3600))
+    except (ValueError, TypeError):
+        exp = 3600
+    rec = {
+        "access_token": toks.get("access_token"),
+        "refresh_token": toks.get("refresh_token"),
+        "expires_at": _t.time() + exp,
+    }
+    _token_cache_write(upn, rec)
+
+
+def _local_windows_upn() -> str | None:
+    """Resolve the logged-in Windows UPN offline (no DC/Kerberos). Tries
+    pywin32 GetUserNameEx(NameUserPrincipal), then `whoami /upn`, then env."""
+    # 1) pywin32
+    try:
+        import win32api  # lazy
+        NameUserPrincipal = 8
+        upn = win32api.GetUserNameEx(NameUserPrincipal)
+        if upn and "@" in upn:
+            return upn.strip().lower()
+    except Exception:
+        pass
+    # 2) whoami /upn
+    try:
+        import subprocess  # lazy
+        out = subprocess.run(["whoami", "/upn"], capture_output=True, text=True, timeout=5)
+        cand = out.stdout.strip()
+        if cand and "@" in cand:
+            return cand.lower()
+    except Exception:
+        pass
+    # 3) env
+    user = os.environ.get("USERNAME", "").strip()
+    dom = os.environ.get("USERDNSDOMAIN", "").strip()
+    if user and dom:
+        return f"{user}@{dom}".lower()
+    return None
+
+
+def _query_auth_mode(base_url: str, upn: str) -> str:
+    """Ask the server which auth this user should use. Kerberos-independent
+    (unauthenticated GET). Returns 'oidc' ONLY on an explicit 200 'oidc';
+    everything else (non-200, non-'oidc' body, network error) -> 'kerberos'."""
+    try:
+        r = httpx.get(base_url.rstrip("/") + "/auth/mode",
+                      params={"upn": upn}, timeout=5.0)
+        if r.status_code == 200 and r.text.strip().lower() == "oidc":
+            return "oidc"
+    except Exception as e:
+        _log_event("auth_mode_query_failed", level=logging.WARNING, error=str(e))
+    return "kerberos"
+
+
+class OidcAuth(httpx.Auth):
+    """Entra OIDC Bearer for httpx. Attaches `Authorization: Bearer <token>`,
+    acquiring/refreshing via the module-level _oidc_acquire_token (Tasks 2-3).
+    Mirrors NegotiateAuth; all OIDC-only imports are lazy in the token helpers."""
+
+    def __init__(self, upn: str):
+        self._upn = upn
+
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        token = _oidc_acquire_token(self._upn, allow_interactive=False)
+        request.headers["Authorization"] = f"Bearer {token}"
+        yield request
+
+
 @dataclass
 class Backend:
     """One backend MCP server. Each backend has its own URL + auth +
@@ -455,6 +784,13 @@ class Backend:
     auth: str = "x-punch-auth"
     # Filled in at fetch time; empty until _load_tools_multi runs.
     tools: list[dict] = field(default_factory=list)
+    # Runtime-computed effective auth mode. Defaults to `auth`; the startup
+    # decision function (_apply_auth_directives) may raise it to "oidc" for a
+    # human backend the server directs + we can acquire a token for. backends.json
+    # is NEVER edited — this is the override channel.
+    effective_auth: str = ""
+    _oidc_upn: str = ""   # the local UPN the decision function resolved (Task 4)
+    _fell_back: bool = False   # directed oidc but fell back to negotiate this session
 
     def __post_init__(self):
         self.url = self.url.rstrip("/")
@@ -469,12 +805,14 @@ class Backend:
             _log_event("backend_unknown_auth_mode", level=logging.WARNING,
                        backend=self.name, auth=self.auth,
                        valid_modes=list(_VALID_AUTH_MODES))
-            self.auth = "x-punch-auth"  # safe-fail; is_configured will catch missing key
+            self.auth = "negotiate"   # safe human default (a human row has no key)
+        if not self.effective_auth:
+            self.effective_auth = self.auth
 
     @property
     def is_configured(self) -> bool:
-        if self.auth == "negotiate":
-            # No key required — the Windows logon ticket is the credential.
+        if self.auth in ("negotiate", "oidc"):
+            # No key required — the Windows logon ticket / OIDC token is the credential.
             return bool(self.url)
         return bool(self.url and self.key and self.header)
 
@@ -489,6 +827,11 @@ class Backend:
         v3.0.0 — when self.auth == "negotiate", attaches a NegotiateAuth
         and omits the X-Punch-Auth header. Otherwise (default
         "x-punch-auth") behaves exactly as before.
+
+        Slice B — dispatches on `effective_auth` (falls back to `auth` if
+        unset) so a startup decision function can raise a human backend to
+        "oidc" without editing backends.json. "oidc" attaches an OidcAuth
+        and, like "negotiate", omits the X-Punch-Auth header.
         """
         rt = read_timeout if read_timeout is not None else PUNCH_SAP_TIMEOUT
         timeouts = httpx.Timeout(connect=5.0, read=rt, write=10.0, pool=5.0)
@@ -502,9 +845,11 @@ class Backend:
             "X-Punch-Shim-Bundled-Version": bundled_v,
             "X-Punch-Shim-Version": _SHIM_VERSION,
             "X-Punch-Shim-Pid": str(os.getpid()),
+            "X-Punch-Shim-Auto-Update": "1" if _AUTO_UPDATE else "0",
         }
         auth: httpx.Auth | None = None
-        if self.auth == "negotiate":
+        mode = self.effective_auth or self.auth
+        if mode == "negotiate":
             host = urlparse(self.url).hostname
             if not host:
                 raise ValueError(
@@ -512,8 +857,12 @@ class Backend:
                     f"URL with a hostname; got {self.url!r}"
                 )
             auth = NegotiateAuth(host)
+        elif mode == "oidc":
+            auth = OidcAuth(self._oidc_upn or "")
         else:
             headers[self.header] = self.key
+        if self._fell_back:
+            headers["X-Punch-Auth-Fallback"] = "oidc->negotiate"
         return httpx.Client(
             base_url=self.url,
             timeout=timeouts,
@@ -522,6 +871,48 @@ class Backend:
             auth=auth,
             headers=headers,
         )
+
+
+def _apply_auth_directives(backends: list[Backend]) -> list[Backend]:
+    """Confirm-before-switch: for each backend the server directs to OIDC AND
+    for which we can (silently, else once-interactively) acquire a token, set
+    effective_auth='oidc'. Otherwise stay 'negotiate' (never override a working
+    Kerberos backend with an unconfirmed directive). Runs at startup."""
+    upn = _local_windows_upn()
+    if not upn:
+        _log_event("oidc_no_local_upn", level=logging.INFO)
+        return backends
+    for b in backends:
+        # Only humans (negotiate) are candidates; x-punch-auth service backends stay put.
+        if b.auth != "negotiate":
+            continue
+        # Reset to base state EVERY pass (this runs again on shim_reload, over
+        # the SAME Backend objects). Without this, a directive that reverts
+        # oidc->kerberos would leave a stale effective_auth="oidc" (or a stale
+        # _fell_back=True) from a prior pass, since the `directive != "oidc"`
+        # continue below never reaches the assignment that would clear it.
+        b.effective_auth = b.auth   # negotiate
+        b._oidc_upn = ""
+        b._fell_back = False
+        directive = _query_auth_mode(b.url, upn)
+        if directive != "oidc":
+            continue
+        try:
+            # Silent first; interactive allowed once (first activation). Bounded.
+            # Broad except: this is a startup/reprobe decision path and must
+            # NEVER crash the shim (it runs at module import), no matter what
+            # the OIDC path raises — network errors, or anything else.
+            _oidc_acquire_token(upn, allow_interactive=True)
+            b.effective_auth = "oidc"
+            b._oidc_upn = upn
+            b._fell_back = False
+            _log_event("oidc_cutover_confirmed", backend=b.name, upn=upn)
+        except Exception as e:
+            b.effective_auth = "negotiate"     # fail-safe: stay on Kerberos this session
+            b._fell_back = True
+            _log_event("oidc_fallback_to_negotiate", level=logging.WARNING,
+                       backend=b.name, upn=upn, error=str(e))
+    return backends
 
 
 def _resolve_backends_path() -> Path:
@@ -1187,6 +1578,7 @@ def _discover_backends(backends: list[Backend]) -> list[Backend]:
 
 _BACKENDS, _PRIMARY = _load_backends()
 _BACKENDS = _discover_backends(_BACKENDS)
+_BACKENDS = _apply_auth_directives(_BACKENDS)
 
 
 # v2.3.1: prime the hot-reload mtime tracker so the FIRST throttle window
@@ -2155,6 +2547,11 @@ async def shim_reload(ctx: Context) -> str:
     this after a backend gains, drops, or changes a tool."""
     try:
         r = _apply_catalogue_reload()
+
+        global _BACKENDS
+        _BACKENDS = _apply_auth_directives(_BACKENDS)
+        _log_event("oidc_reprobe", backend_names=[b.name for b in _BACKENDS])
+
         if r["moved"]:
             await ctx.session.send_tool_list_changed()
 
