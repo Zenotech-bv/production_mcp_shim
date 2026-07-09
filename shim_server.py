@@ -194,7 +194,7 @@ from mcp.server.fastmcp import Context, FastMCP
 # launch, so the env converges with no per-laptop action. Best-effort +
 # idempotent; never blocks startup. Logic change, but no behaviour change for
 # an already-fixed (v3.4.3+) manifest — it's a no-op there.
-_SHIM_VERSION = "3.5.2"
+_SHIM_VERSION = "3.5.3"
 # v3.5.2 — OIDC directive pre-flight (the /auth/mode probe, token refresh, and
 #          up-to-120s first-time interactive sign-in) moved OFF the startup path
 #          onto a background daemon thread. shim_ready is no longer gated on
@@ -2683,6 +2683,20 @@ async def shim_info(ctx: Context) -> str:
     troubleshooting (e.g. confirming auth=negotiate is set on the SAP
     backend after a backends.json edit).
 
+    Each backend reports BOTH ``auth`` (the static backends.json default)
+    and ``effective_auth`` (what the shim actually dispatches on right now).
+    The OIDC cutover directive flips ``effective_auth`` to "oidc" at startup
+    while ``auth`` stays "negotiate" — so to answer "am I on OIDC?", read
+    ``effective_auth``, NOT ``auth``. ``effective_auth`` mirrors the shim's
+    real dispatch decision (an "oidc" backend with no resolved UPN reports
+    "negotiate", exactly as it would be sent). ``oidc_upn`` names the identity
+    the OIDC leg authenticates as (populated only when effective_auth ==
+    "oidc"). ``fell_back`` is True when OIDC was directed this session but token
+    acquisition failed and the shim fell back to Kerberos — distinct from a
+    backend that was never directed to OIDC. The top-level
+    ``auth_directive_pending`` is True while the startup OIDC preflight is still
+    resolving (an early call may read "negotiate" before OIDC takes).
+
     No side effects. Doesn't talk to any backend — uses the already-loaded
     in-process registry.
     """
@@ -2690,10 +2704,30 @@ async def shim_info(ctx: Context) -> str:
         backends_payload: list[dict[str, Any]] = []
         for b in _BACKENDS:
             tool_count = sum(1 for _name, _tool, bk in _REGISTRATIONS if bk is b)
+            # effective_auth is what the shim dispatches on right now (the OIDC
+            # startup directive flips it to "oidc"); `auth` is only the static
+            # backends.json default. Reporting both is what lets a chat answer
+            # "am I on OIDC?" correctly — shim_info used to show only `auth`
+            # (negotiate) and misled users mid-cutover into thinking OIDC
+            # hadn't taken.
+            #
+            # Mirror http_client's dispatch decision EXACTLY (see http_client:
+            # `mode = effective_auth or auth; if mode == "oidc" and not
+            # _oidc_upn: mode = "negotiate"`). Reporting effective_auth="oidc"
+            # for a backend that has no resolved UPN — and therefore actually
+            # sends Negotiate — would just re-create the original mislead with
+            # the sign flipped. fell_back distinguishes "directed to OIDC but
+            # token acquisition failed this session" from "never directed".
+            eff = b.effective_auth or b.auth
+            if eff == "oidc" and not b._oidc_upn:
+                eff = "negotiate"
             backends_payload.append({
                 "name":                   b.name,
                 "url":                    b.url,
                 "auth":                   b.auth,
+                "effective_auth":         eff,
+                "oidc_upn":               (b._oidc_upn or None) if eff == "oidc" else None,
+                "fell_back":              b._fell_back,
                 "header":                 b.header if b.auth == "x-punch-auth" else None,
                 "configured":             b.is_configured,
                 "registered_tool_count":  tool_count,
@@ -2736,6 +2770,12 @@ async def shim_info(ctx: Context) -> str:
             "backend_count":        len(_BACKENDS),
             "backends":             backends_payload,
             "auto_update_enabled":  _AUTO_UPDATE,
+            # True while the startup OIDC preflight is still resolving on its
+            # background thread (first activation can include an interactive
+            # browser sign-in). Until it lands, effective_auth reads the static
+            # default; this flag says "not yet determined" rather than letting a
+            # too-early call read a definitive-looking "negotiate".
+            "auth_directive_pending": bool(_AUTH_PREFLIGHT_THREAD and _AUTH_PREFLIGHT_THREAD.is_alive()),
             "process_env":          env_diagnostics,
         }, indent=2)
     except Exception as e:
