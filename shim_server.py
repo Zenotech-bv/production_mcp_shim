@@ -194,7 +194,38 @@ from mcp.server.fastmcp import Context, FastMCP
 # launch, so the env converges with no per-laptop action. Best-effort +
 # idempotent; never blocks startup. Logic change, but no behaviour change for
 # an already-fixed (v3.4.3+) manifest — it's a no-op there.
-_SHIM_VERSION = "3.5.3"
+_SHIM_VERSION = "3.6.1"
+# v3.6.1 — FIX a v3.6.0 regression found on first install (2026-07-16): v3.6.0
+#          deferred supervisor discovery to the background warmup on the false
+#          assumption that backends.json carries the core backends. It does not:
+#          a real laptop's backends.json has only sap+zabbix, and rd
+#          (Windchill/Polarion/SVN) + tutorials are DISCOVERED. The registry was
+#          therefore built from 2 backends and rd/tutorials registered ZERO tools
+#          until a manual shim_reload (and the OIDC pre-flight never saw rd).
+#          Discovery is back on the import path, before the pre-flight and the
+#          registry build — it DEFINES the backend set and is one fast
+#          supervisor GET, not a per-backend cost. Guarded by
+#          test_discovery_runs_before_registry_build_and_preflight.
+# v3.6.0 — two reliability fixes so OIDC is at least as good as Kerberos and the
+#          shim starts fast:
+#          (1) Request-time auth self-heal. OidcAuth now mirrors NegotiateAuth's
+#              401-continuation: on a rejected Bearer it force-refreshes the token
+#              (bypassing the cache) and retries ONCE over OIDC, recovering a
+#              stale/early-expired/clock-skewed token without leaving OIDC. If a
+#              freshly-minted token is STILL rejected (a genuine audience/config
+#              mismatch — the rd 2026-07-15 outage), _call_remote cross-falls-back
+#              to Kerberos for that call and sticks to it for the session
+#              (shim_reload re-probes). A held token that the server 401-rejected
+#              used to dead-end with no retry; now it self-heals or degrades
+#              cleanly. 403 (authorization) is deliberately never retried.
+#          (2) Fast, non-blocking start. The serial per-backend network I/O that
+#              hung Claude Desktop's Extensions panel (discovery, self-update, a
+#              GET /tools + GET /health per backend, all BEFORE mcp.run()) moved
+#              off the critical path: the tool catalogue is disk-cached and
+#              registered with ZERO network on a warm start; a cold start fetches
+#              /tools in PARALLEL; discovery, self-update, the live catalogue
+#              refresh and the /health seed run on a background daemon
+#              (_startup_warmup). initialize now answers in well under a second.
 # v3.5.2 — OIDC directive pre-flight (the /auth/mode probe, token refresh, and
 #          up-to-120s first-time interactive sign-in) moved OFF the startup path
 #          onto a background daemon thread. shim_ready is no longer gated on
@@ -307,6 +338,18 @@ _AUTO_UPDATE = os.getenv("PUNCH_SHIM_AUTO_UPDATE", "0").strip().lower() in (
     "1", "true", "yes", "on", "enable", "enabled",
 )
 _DEBUG = os.getenv("PUNCH_SHIM_DEBUG", "0").strip() == "1"
+# v3.6.0 — the background startup warmup (live catalogue refresh, discovery,
+# self-update, /health seed). On by default; set to a falsey value to keep the
+# shim on exactly the import-time (cached/parallel-fetched) catalogue with no
+# background reconcile — an ops escape hatch, not a normal setting.
+_WARMUP_ENABLED = os.getenv("PUNCH_SHIM_WARMUP", "1").strip().lower() not in (
+    "0", "false", "no", "off", "disable", "disabled",
+)
+# Small delay before the warmup thread does its first registry reconcile, so the
+# very first initialize/tools/list is served from the stable import-time
+# catalogue before any background mutation. Sub-second; only delays live-catalogue
+# freshness, never startup.
+_WARMUP_DELAY_S = float(os.getenv("PUNCH_SHIM_WARMUP_DELAY_S", "0.75"))
 
 
 # ---------------------------------------------------------------------------
@@ -685,11 +728,17 @@ def _token_cache_read(upn: str) -> dict | None:
         return None
 
 
-def _oidc_acquire_token(upn: str, *, allow_interactive: bool) -> str:
+def _oidc_acquire_token(upn: str, *, allow_interactive: bool,
+                        force_refresh: bool = False) -> str:
     import time as _t, secrets  # lazy
     cached = _token_cache_read(upn)
     if cached:
-        if cached.get("access_token") and float(cached.get("expires_at", 0)) - 60 > _t.time():
+        # force_refresh (v3.6.0): a token the SERVER just rejected with 401.
+        # Skip the "cached access token is still valid" fast-path and mint a
+        # fresh one (refresh, else interactive) so OidcAuth can retry with a
+        # brand-new token — the OIDC analogue of Kerberos re-minting per call.
+        if (not force_refresh and cached.get("access_token")
+                and float(cached.get("expires_at", 0)) - 60 > _t.time()):
             return cached["access_token"]
         if cached.get("refresh_token"):
             try:
@@ -778,7 +827,23 @@ class OidcAuth(httpx.Auth):
     def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
         token = _oidc_acquire_token(self._upn, allow_interactive=False)
         request.headers["Authorization"] = f"Bearer {token}"
-        yield request
+        response = yield request
+        # v3.6.0 — parity with NegotiateAuth's 401 continuation leg. A rejected
+        # Bearer might be stale / early-expired / clock-skewed; mint a FRESH one
+        # (force-refresh, bypassing the cache) and retry ONCE. This keeps OIDC
+        # self-healing like Kerberos instead of hard-failing a transient
+        # rejection. A genuinely wrong-audience token will 401 again on the
+        # retry; _call_remote then cross-falls-back to Kerberos. Best-effort:
+        # any acquisition failure just lets the original 401 stand.
+        if response.status_code == 401:
+            try:
+                fresh = _oidc_acquire_token(self._upn, allow_interactive=False,
+                                            force_refresh=True)
+            except OidcError:
+                return
+            if fresh and fresh != token:
+                request.headers["Authorization"] = f"Bearer {fresh}"
+                yield request
 
 
 @dataclass
@@ -827,7 +892,8 @@ class Backend:
             return bool(self.url)
         return bool(self.url and self.key and self.header)
 
-    def http_client(self, *, read_timeout: float | None = None) -> httpx.Client:
+    def http_client(self, *, read_timeout: float | None = None,
+                    force_auth: str | None = None) -> httpx.Client:
         """Build a fresh httpx.Client for this backend.
 
         v2.2.2 stale-socket defenses preserved:
@@ -859,7 +925,11 @@ class Backend:
             "X-Punch-Shim-Auto-Update": "1" if _AUTO_UPDATE else "0",
         }
         auth: httpx.Auth | None = None
-        mode = self.effective_auth or self.auth
+        # v3.6.0 - force_auth overrides the resolved mode for one client (the
+        # _call_remote 401->Kerberos self-heal builds a force_auth="negotiate"
+        # client to retry a rejected OIDC call over the always-working Kerberos
+        # path). When None, behaviour is exactly as before.
+        mode = force_auth or (self.effective_auth or self.auth)
         # v3.5.2 - snapshot _oidc_upn alongside the mode. The background directive
         # pre-flight (another thread) can flip effective_auth and clear/set
         # _oidc_upn between our reads; if we observe mode "oidc" without a
@@ -1644,6 +1714,15 @@ def _discover_backends(backends: list[Backend]) -> list[Backend]:
 
 
 _BACKENDS, _PRIMARY = _load_backends()
+# v3.6.0 — discovery MUST stay on the import path; it DEFINES the backend set.
+# It is not "additive extras": on a real laptop backends.json carries only
+# sap + zabbix, and the supervisor DISCOVERS rd + tutorials. A pre-release build
+# deferred this to _startup_warmup and the registry was consequently built from
+# 2 backends — rd (Windchill/Polarion/SVN) and tutorials registered ZERO tools
+# until a manual shim_reload, and the OIDC pre-flight below never saw rd. Cost
+# is ONE fast GET to the supervisor (3s worst-case timeout, best-effort, never
+# raises), not a per-backend cost — so it stays here, before the OIDC pre-flight
+# and before the registry is built. See test_discovery_runs_before_registry_build.
 _BACKENDS = _discover_backends(_BACKENDS)
 # v3.5.2 - resolve OIDC directives on a background daemon thread so startup
 # reports ready immediately. Backends keep their working negotiate credential
@@ -1920,8 +1999,11 @@ def _heal_manifest_uv_env(manifest_path: Path) -> bool:
     return True
 
 
-_maybe_self_update()
-_heal_manifest_uv_env(_packaged_manifest_path())
+# v3.6.0 - _maybe_self_update() (GitHub manifest+source fetch, up to ~40s) and
+# _heal_manifest_uv_env() moved OFF the import critical path into _startup_warmup.
+# The update only ever STAGES a new file for the NEXT launch (it never re-execs
+# this session), so running it in the background changes nothing about when it
+# takes effect — it just stops blocking initialize.
 
 
 # ---------------------------------------------------------------------------
@@ -1993,6 +2075,119 @@ def _probe_backend(backend: Backend) -> dict:
     return result
 
 
+# ---------------------------------------------------------------------------
+# v3.6.0 — startup catalogue cache + parallel fetch (fast, non-blocking start)
+#
+# The import-time cost that hung Claude Desktop's Extensions panel was serial,
+# per-backend network I/O BEFORE mcp.run(): discovery, self-update, a GET /tools
+# per backend, and a GET /health per backend (5s timeouts each), summed. v3.6.0
+# moves all of it off the startup critical path:
+#   * the last-known-good tool catalogue is cached to disk and registered at
+#     import with ZERO network on a warm start;
+#   * a cold start (no cache / a new backend) fetches the missing backends'
+#     /tools in PARALLEL (bounded by one timeout, not the serial sum);
+#   * discovery, self-update, the live catalogue refresh and the /health seed
+#     run on a background daemon (_startup_warmup) after mcp.run() is serving.
+# ---------------------------------------------------------------------------
+
+_CATALOGUE_CACHE_VERSION = 1
+
+
+def _catalogue_cache_path() -> Path:
+    """Where the tool-catalogue cache lives — beside the shim log under
+    %LOCALAPPDATA%\\PunchAnalytics (test-isolated via _resolve_log_dir)."""
+    return _resolve_log_dir() / "catalogue_cache.json"
+
+
+def _write_catalogue_cache(backends: list[Backend]) -> None:
+    """Persist each backend's (url, tools) so the next launch registers the full
+    catalogue with no network. Best-effort; never raises. Backends with no tools
+    are omitted (don't cache an empty set over a good one from a transient miss)."""
+    payload = {
+        "cache_version": _CATALOGUE_CACHE_VERSION,
+        "shim_version": _SHIM_VERSION,
+        "backends": {
+            b.name: {"url": b.url, "tools": b.tools}
+            for b in backends if b.tools
+        },
+    }
+    try:
+        _catalogue_cache_path().write_text(json.dumps(payload), encoding="utf-8")
+    except OSError as e:
+        _log_event("catalogue_cache_write_failed", level=logging.WARNING,
+                   error=f"{type(e).__name__}: {e}")
+
+
+def _read_catalogue_cache() -> dict | None:
+    """Read the on-disk catalogue cache, or None if absent / unreadable / a
+    different cache_version. Never raises."""
+    try:
+        data = json.loads(_catalogue_cache_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("cache_version") != _CATALOGUE_CACHE_VERSION:
+        return None
+    return data
+
+
+def _load_catalogue_into_backends(backends: list[Backend]) -> int:
+    """Populate backend.tools from the disk cache for any backend whose tools are
+    empty and whose cached url still matches (a url change invalidates the
+    entry — never serve a moved backend's stale catalogue). Returns how many
+    backends were populated. Never raises."""
+    cache = _read_catalogue_cache()
+    if not cache:
+        return 0
+    entries = cache.get("backends")
+    if not isinstance(entries, dict):
+        return 0
+    loaded = 0
+    for b in backends:
+        if b.tools:
+            continue
+        entry = entries.get(b.name)
+        if not isinstance(entry, dict) or entry.get("url") != b.url:
+            continue
+        tools = entry.get("tools")
+        # Require a non-empty list of dicts; a cache with any malformed element
+        # is dropped for this backend (-> cold fetch) rather than partially used.
+        if (isinstance(tools, list) and tools
+                and all(isinstance(t, dict) for t in tools)):
+            b.tools = tools
+            loaded += 1
+    if loaded:
+        _log_event("catalogue_cache_loaded", backends_loaded=loaded,
+                   total_backends=len(backends))
+    return loaded
+
+
+def _fetch_all_tools_parallel(backends: list[Backend]) -> None:
+    """Fetch /tools for every CONFIGURED backend that still has no tools,
+    CONCURRENTLY, so a cold start pays ~one fetch timeout instead of the serial
+    sum. Mutates backend.tools in place. Each fetch is individually bounded by
+    _fetch_tools_for_backend's own httpx timeouts. Best-effort; never raises."""
+    import concurrent.futures  # lazy: only the cold-start path needs it
+    targets = [b for b in backends if b.is_configured and not b.tools]
+    if not targets:
+        return
+
+    def _one(b: Backend) -> tuple[Backend, list[dict]]:
+        tools = _fetch_tools_for_backend(b) or []
+        if not tools and b.name == "sap":
+            tools = _load_bundled_sap_fallback()
+        return b, tools
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(len(targets), 8),
+                thread_name_prefix="punch-tools-fetch") as ex:
+            for b, tools in ex.map(_one, targets):
+                b.tools = tools
+    except Exception as e:
+        _log_event("parallel_tools_fetch_error", level=logging.WARNING,
+                   error=f"{type(e).__name__}: {e}")
+
+
 def _load_bundled_sap_fallback() -> list[dict]:
     """If the SAP backend is unreachable AND a bundled tools.json
     exists, register the bundled tool set under the SAP backend's name.
@@ -2023,6 +2218,8 @@ def _load_bundled_sap_fallback() -> list[dict]:
 
 def _build_merged_registry(
     backends: list[Backend],
+    *,
+    fetch_missing: bool = True,
 ) -> tuple[dict[str, tuple[Backend, str]], list[tuple[str, dict, Backend]]]:
     """Fetch tools from each backend, build the registered-name map.
 
@@ -2043,7 +2240,7 @@ def _build_merged_registry(
     # patching the HTTP fetch — every other call path enters with
     # backend.tools=[] and triggers the live fetch as before.
     for backend in backends:
-        if not backend.tools:
+        if not backend.tools and fetch_missing:
             backend.tools = _fetch_tools_for_backend(backend) or []
             # SAP-specific bundled fallback for the offline case. Only
             # applies to the backend named "sap" — other backends don't
@@ -2052,9 +2249,16 @@ def _build_merged_registry(
                 backend.tools = _load_bundled_sap_fallback()
 
     # 2. Count occurrences of each bare tool name across backends.
+    # v3.6.0 — skip any non-dict entry defensively. tools can come from a
+    # backend's /tools OR the on-disk catalogue cache; a single malformed
+    # element (e.g. a truncated cache write that still parses to `[null]`) must
+    # NOT crash the build, which runs at import and would otherwise brick every
+    # launch before warmup/auto-refresh could self-heal.
     bare_counts: dict[str, int] = defaultdict(int)
     for backend in backends:
         for t in backend.tools:
+            if not isinstance(t, dict):
+                continue
             name = t.get("name")
             if isinstance(name, str) and name:
                 bare_counts[name] += 1
@@ -2066,6 +2270,8 @@ def _build_merged_registry(
 
     for backend in backends:
         for tool in backend.tools:
+            if not isinstance(tool, dict):
+                continue
             orig = tool.get("name")
             if not isinstance(orig, str) or not orig:
                 continue
@@ -2109,7 +2315,30 @@ def _build_merged_registry(
     return name_to_backend, registrations
 
 
-_NAME_TO_BACKEND, _REGISTRATIONS = _build_merged_registry(_BACKENDS)
+# v3.6.0 — cache-first registry build (no serial network on the critical path).
+# Warm start: register the full catalogue from the disk cache instantly, zero
+# network. Cold start (no cache / a new backend): fetch the missing backends'
+# /tools in PARALLEL (bounded), never serially. Either way the authoritative
+# live refresh happens in _startup_warmup once mcp.run() is already serving.
+try:
+    _load_catalogue_into_backends(_BACKENDS)
+    if any(b.is_configured and not b.tools for b in _BACKENDS):
+        _fetch_all_tools_parallel(_BACKENDS)
+    _NAME_TO_BACKEND, _REGISTRATIONS = _build_merged_registry(_BACKENDS, fetch_missing=False)
+    _write_catalogue_cache(_BACKENDS)
+except Exception as _e:
+    # Last-resort brick guard: a corrupt cache / malformed catalogue must NEVER
+    # crash module import — that would fail EVERY launch, before warmup or the
+    # on-call auto-refresh could self-heal. Degrade to an empty registry; the
+    # first tool call's _maybe_refresh_catalogue re-fetches from live. Drop the
+    # (possibly poisoned) cache so the next launch starts clean.
+    _log_event("startup_registry_build_failed", level=logging.ERROR,
+               error=f"{type(_e).__name__}: {_e}")
+    _NAME_TO_BACKEND, _REGISTRATIONS = {}, []
+    try:
+        _catalogue_cache_path().unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _reload_registry() -> tuple[
@@ -2227,6 +2456,10 @@ def _apply_catalogue_reload() -> dict:
     _NAME_TO_BACKEND = new_name_to_backend
     _REGISTRATIONS   = new_registrations
 
+    # v3.6.0 — keep the on-disk catalogue cache current so the next launch's warm
+    # start registers this freshly-reconciled set with no network.
+    _write_catalogue_cache(_BACKENDS)
+
     return {
         "added": sorted(added),
         "removed": sorted(removed),
@@ -2278,13 +2511,10 @@ def _maybe_refresh_catalogue() -> dict | None:
     return result
 
 
-# Seed the catalogue stamps so the watcher has a baseline matching what we just
-# registered at import. Best-effort: a backend unreachable now leaves its stamp
-# unset, and the first successful runtime probe reconciles (re-fetches) then.
-for _b in _BACKENDS:
-    _seed = _probe_catalogue_stamp(_b)
-    if _seed is not None:
-        _CATALOGUE_STAMPS[_b.name] = _seed
+# v3.6.0 — the catalogue-stamp seed (a GET /health per backend, 5s each) moved
+# OFF the import critical path into _startup_warmup. Until it seeds, an unset
+# baseline just makes the first per-call auto-refresh reconcile once (the
+# existing "unknown baseline -> reload" path), so nothing is lost by deferring.
 
 
 # ---------------------------------------------------------------------------
@@ -2388,46 +2618,105 @@ def _call_remote(registered_name: str, kwargs: dict) -> str:
                    original=original_name,
                    backend=backend.name,
                    arg_keys=list(kwargs.keys()))
-    try:
-        with backend.http_client() as c:
-            r = c.post(f"/tools/{original_name}", json=kwargs)
-    except httpx.ConnectError as e:
-        elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
-        _log_event("tool_call_unreachable", level=logging.ERROR,
+
+    def _post_once(force_auth: str | None):
+        """One POST attempt. Returns (response, error_json, oidc_broke):
+          (resp, None, False)  -> an HTTP response arrived (any status);
+          (None, err_json, False) -> transport error, envelope ready to return;
+          (None, None, True)   -> the OIDC token could not be acquired this call.
+        """
+        a0 = time.monotonic()
+        try:
+            with backend.http_client(force_auth=force_auth) as c:
+                return c.post(f"/tools/{original_name}", json=kwargs), None, False
+        except OidcError as e:
+            _log_event("oidc_acquire_failed", level=logging.WARNING,
+                       tool=registered_name, backend=backend.name,
+                       error=f"{type(e).__name__}: {e}")
+            return None, None, True
+        except httpx.ConnectError as e:
+            elapsed_ms = round((time.monotonic() - a0) * 1000, 1)
+            _log_event("tool_call_unreachable", level=logging.ERROR,
+                       tool=registered_name, backend=backend.name,
+                       elapsed_ms=elapsed_ms,
+                       error=f"{type(e).__name__}: {e}")
+            return None, json.dumps({
+                "error": True,
+                "error_type": "Unreachable",
+                "message": f"Cannot reach backend {backend.name!r} at {backend.url} - on VPN? {e}",
+                "_shim_served_by": backend.name,
+            }, indent=2), False
+        except httpx.TimeoutException as e:
+            elapsed_ms = round((time.monotonic() - a0) * 1000, 1)
+            _log_event("tool_call_timeout", level=logging.ERROR,
+                       tool=registered_name, backend=backend.name,
+                       elapsed_ms=elapsed_ms,
+                       error=f"{type(e).__name__}")
+            return None, json.dumps({
+                "error": True,
+                "error_type": "Timeout",
+                "message": (
+                    f"No response from backend {backend.name!r} "
+                    f"({backend.url}) in {PUNCH_SAP_TIMEOUT}s"
+                ),
+                "_shim_served_by": backend.name,
+            }, indent=2), False
+        except Exception as e:
+            elapsed_ms = round((time.monotonic() - a0) * 1000, 1)
+            _log_event("tool_call_transport_error", level=logging.ERROR,
+                       tool=registered_name, backend=backend.name,
+                       elapsed_ms=elapsed_ms,
+                       error=f"{type(e).__name__}: {e}")
+            return None, json.dumps({
+                "error": True,
+                "error_type": "TransportError",
+                "message": str(e),
+                "_shim_served_by": backend.name,
+            }, indent=2), False
+
+    # v3.6.0 — request-time auth self-heal (cross-scheme fallback). When this
+    # backend is on OIDC and, even after OidcAuth's own force-refresh+retry, the
+    # server STILL rejects the token with 401 (a genuine audience/config
+    # mismatch, e.g. the rd 2026-07-15 outage) — OR the token can't be minted at
+    # all this call — retry the SAME call over Kerberos and stick to Kerberos for
+    # the rest of the session (shim_reload / the startup pre-flight re-probe).
+    # Kerberos was always the working path, so this turns that failure class from
+    # a hard outage into a transparent degrade. 403 is deliberately NOT retried:
+    # it is an authorization decision that the same identity would hit over
+    # Kerberos too, and retrying would mask it.
+    first_mode = backend.effective_auth or backend.auth
+    oidc_first = first_mode == "oidc" and bool(backend._oidc_upn)
+
+    r, err, oidc_broke = _post_once(force_auth=None)
+    if oidc_first and (oidc_broke or (r is not None and r.status_code == 401)):
+        reason = "token_acquire_failed" if oidc_broke else "server_rejected_token_401"
+        _log_event("oidc_request_fallback_to_negotiate", level=logging.WARNING,
                    tool=registered_name, backend=backend.name,
-                   elapsed_ms=elapsed_ms,
-                   error=f"{type(e).__name__}: {e}")
+                   upn=backend._oidc_upn, reason=reason)
+        # Sticky for the session. GIL-atomic attribute writes, intentionally
+        # lock-free (mirrors http_client's lock-free reads): the directive
+        # thread may re-flip to oidc on a later pass / shim_reload, and a
+        # still-broken token simply falls back again — never a hard failure.
+        backend._fell_back = True
+        backend.effective_auth = "negotiate"
+        r, err, oidc_broke = _post_once(force_auth="negotiate")
+
+    if err is not None:
+        return err
+    if r is None:
+        # No response and no transport envelope — OIDC could not mint a token and
+        # there was no usable Kerberos fallback identity. Surface a clear error
+        # rather than crash (this is the shape a wholly-unauthenticatable backend
+        # takes; it never happened before because a held token 401'd terminally).
+        _log_event("tool_call_auth_unavailable", level=logging.ERROR,
+                   tool=registered_name, backend=backend.name)
         return json.dumps({
             "error": True,
-            "error_type": "Unreachable",
-            "message": f"Cannot reach backend {backend.name!r} at {backend.url} - on VPN? {e}",
-            "_shim_served_by": backend.name,
-        }, indent=2)
-    except httpx.TimeoutException as e:
-        elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
-        _log_event("tool_call_timeout", level=logging.ERROR,
-                   tool=registered_name, backend=backend.name,
-                   elapsed_ms=elapsed_ms,
-                   error=f"{type(e).__name__}")
-        return json.dumps({
-            "error": True,
-            "error_type": "Timeout",
+            "error_type": "AuthUnavailable",
             "message": (
-                f"No response from backend {backend.name!r} "
-                f"({backend.url}) in {PUNCH_SAP_TIMEOUT}s"
+                f"Could not authenticate to backend {backend.name!r} "
+                f"(neither OIDC nor Kerberos produced a usable credential)."
             ),
-            "_shim_served_by": backend.name,
-        }, indent=2)
-    except Exception as e:
-        elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
-        _log_event("tool_call_transport_error", level=logging.ERROR,
-                   tool=registered_name, backend=backend.name,
-                   elapsed_ms=elapsed_ms,
-                   error=f"{type(e).__name__}: {e}")
-        return json.dumps({
-            "error": True,
-            "error_type": "TransportError",
-            "message": str(e),
             "_shim_served_by": backend.name,
         }, indent=2)
 
@@ -2620,7 +2909,10 @@ async def shim_reload(ctx: Context) -> str:
     shim's registered tools in place — no Claude Desktop restart needed. Call
     this after a backend gains, drops, or changes a tool."""
     try:
-        r = _apply_catalogue_reload()
+        # v3.6.0 - hold the reload lock (consistent with _maybe_refresh_catalogue)
+        # so a reconcile is never interleaved with the auto-refresh path.
+        with _BACKENDS_RELOAD_LOCK:
+            r = _apply_catalogue_reload()
 
         # v3.5.2 - reprobe OIDC directives OFF the event loop (background daemon)
         # and NON-interactively: a shim_reload must never block the conversation
@@ -2864,6 +3156,71 @@ mcp.tool()(shim_access)
 
 
 # ---------------------------------------------------------------------------
+# v3.6.0 — background startup warmup
+#
+# Everything that used to block `initialize` with serial per-backend network I/O
+# now runs here, on a daemon thread, AFTER mcp.run() is already serving. Each
+# step is best-effort and isolated: one failing never stops the others and never
+# crashes the shim. The registry the client sees at connect time is the stable
+# import-time (cached / parallel-fetched) catalogue; this thread reconciles it
+# with live truth a beat later.
+# ---------------------------------------------------------------------------
+
+_WARMUP_THREAD: "threading.Thread | None" = None
+
+
+def _startup_warmup() -> None:
+    """Run the deferred, off-critical-path startup work on a daemon thread.
+
+    THREADING CONTRACT: this thread MUST NOT mutate FastMCP's tool registry.
+    Sync tool forwarders and shim_reload run on the asyncio event-loop thread
+    (mcp calls a sync tool as a bare `fn(...)`), and list_tools does
+    `list(self._tools.values())` there — so mutating `_tools` from this daemon
+    would race that iteration (RuntimeError: dictionary changed size during
+    iteration) on exactly the catalogue-delta case. Therefore the authoritative
+    LIVE tool-catalogue refresh is left to the existing ON-LOOP path
+    (_maybe_refresh_catalogue): with the stamp baseline unseeded at startup, the
+    first tool call reconciles the registry safely on the loop thread, and a new
+    chat then sees the fresh catalogue — the same self-heal that already handles
+    a mid-session backend deploy.
+
+    NOTE: supervisor discovery is deliberately NOT here — it defines the backend
+    set the registry is built from, so it must run at import (see the
+    _discover_backends call there). Deferring it here registered zero tools for
+    every discovery-supplied backend (rd, tutorials). What remains is only work
+    that touches no loop-owned state and no startup-critical state.
+    """
+    if _WARMUP_DELAY_S > 0:
+        time.sleep(_WARMUP_DELAY_S)
+
+    # Self-update (stages a new file for the NEXT launch; never re-execs this
+    # session) and packaged-manifest heal. Pure file I/O; no loop-owned state.
+    # This is the expensive one that used to block startup: a GitHub manifest +
+    # source fetch, up to ~40s.
+    try:
+        _maybe_self_update()
+        _heal_manifest_uv_env(_packaged_manifest_path())
+    except Exception as e:
+        _log_event("warmup_selfupdate_error", level=logging.WARNING,
+                   error=f"{type(e).__name__}: {e}")
+
+    _log_event("shim_warmup_done", backend_count=len(_BACKENDS))
+
+
+def _start_background_warmup() -> "threading.Thread | None":
+    """Start _startup_warmup on a daemon thread, unless disabled by
+    PUNCH_SHIM_WARMUP. Returns the thread (or None)."""
+    if not _WARMUP_ENABLED:
+        _log_event("warmup_disabled", level=logging.INFO)
+        return None
+    global _WARMUP_THREAD
+    _WARMUP_THREAD = threading.Thread(
+        target=_startup_warmup, name="punch-startup-warmup", daemon=True)
+    _WARMUP_THREAD.start()
+    return _WARMUP_THREAD
+
+
+# ---------------------------------------------------------------------------
 # Entry
 # ---------------------------------------------------------------------------
 
@@ -2875,4 +3232,8 @@ if __name__ == "__main__":
         registered_tool_count=len(_REGISTRATIONS),
         unique_name_count=len(_NAME_TO_BACKEND),
     )
+    # v3.6.0 — kick off the deferred live-refresh / discovery / self-update work
+    # in the background, then start serving immediately. Only in __main__ (a real
+    # launch) — importing the module for tests never spawns it.
+    _start_background_warmup()
     mcp.run(transport="stdio")
