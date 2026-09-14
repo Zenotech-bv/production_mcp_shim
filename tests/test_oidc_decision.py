@@ -22,16 +22,15 @@ def test_query_auth_mode_oidc(monkeypatch):
 
 def test_query_auth_mode_collapses_non_oidc_to_kerberos(monkeypatch):
     shim = _shim()
-    # 200 "kerberos", a 429, a 500, and a network error all -> "kerberos".
+    # 200 "kerberos" and a 429 -> "kerberos".
     monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(200, text="kerberos"))
     assert shim._query_auth_mode("http://x:3000", "a@p.com") == "kerberos"
     monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(429, text="kerberos"))
     assert shim._query_auth_mode("http://x:3000", "a@p.com") == "kerberos"
 
-    def _boom(*a, **k):
-        raise httpx.ConnectError("down")
-    monkeypatch.setattr(httpx, "get", _boom)
-    assert shim._query_auth_mode("http://x:3000", "a@p.com") == "kerberos"
+    # v3.6.2: a network error is NOT a directive - it reports "unknown"
+    # (covered in test_auth_mode_unknown_selfheal.py). HTTP answers above
+    # still collapse to "kerberos".
 
 
 def test_directive_oidc_and_token_ok_switches_to_oidc(monkeypatch):
