@@ -1685,6 +1685,13 @@ def _fetch_discovery() -> dict | None:
     object, or None on any failure -- disabled (empty URL), unreachable,
     timeout, non-200, or a non-JSON / non-object body. Never raises."""
     if not _DISCOVERY_URL:
+        # WAS THE ONE SILENT EXIT IN THIS FUNCTION, and on 2026-09-29 it cost three restarts: the shim
+        # came up with 2 backends of 5, every other exit here logs, and the log said nothing at all --
+        # so the cause could not be established from it. An unexplained failure is a bug even when the
+        # behaviour is intended.
+        _log_event("discovery_disabled", level=logging.WARNING,
+                   reason="PUNCH_SHIM_DISCOVERY_URL is empty, so the supervisor is never asked",
+                   note="backends come only from backends.json, which on a laptop is sap + zabbix")
         return None
     try:
         with httpx.Client(timeout=_DISCOVERY_TIMEOUT_S) as c:
@@ -1711,6 +1718,9 @@ def _discover_backends(backends: list[Backend]) -> list[Backend]:
     startup and never shrinks the backend set."""
     payload = _fetch_discovery()
     if payload is None:
+        _log_event("discovery_unavailable", level=logging.WARNING,
+                   backends=[b.name for b in backends],
+                   note="running on the local backend list only; a discovered backend registers no tools")
         return backends
     discovered = payload.get("backends")
     if not isinstance(discovered, list):
@@ -1739,6 +1749,12 @@ def _discover_backends(backends: list[Backend]) -> list[Backend]:
         added.append(name)
     if added:
         _log_event("discovery_merged", added=added, total_backends=len(result))
+    else:
+        # ALSO LOGGED. "Discovery ran and added nothing" and "discovery never ran" produced the same
+        # silence, and they need entirely different fixes.
+        _log_event("discovery_added_nothing", level=logging.INFO,
+                   discovered=[str((e or {}).get("name") or "") for e in discovered if isinstance(e, dict)],
+                   already_known=sorted(known), total_backends=len(result))
     return result
 
 
@@ -3019,14 +3035,36 @@ if _REGISTRATION_FAILURES:
 # ---------------------------------------------------------------------------
 
 async def shim_reload(ctx: Context) -> str:
-    """Re-fetch the tool catalogue from every Punch backend and update this
-    shim's registered tools in place — no Claude Desktop restart needed. Call
-    this after a backend gains, drops, or changes a tool."""
+    """Re-ask the supervisor which backends exist, re-fetch every backend's tool
+    catalogue, and update this shim's registered tools in place — no Claude
+    Desktop restart needed. Call this after a backend gains, drops, or changes a
+    tool, or when a backend is missing entirely."""
     try:
         # v3.6.0 - hold the reload lock (consistent with _maybe_refresh_catalogue)
         # so a reconcile is never interleaved with the auto-refresh path.
         with _BACKENDS_RELOAD_LOCK:
+            # DISCOVERY FIRST, so a reload can repair a SHORT BACKEND LIST and not only a stale
+            # catalogue. On 2026-09-29 the shim came up with 2 backends of 5 and this tool answered
+            # "No changes - every backend's catalogue is already current" while three backends were
+            # missing and every soc_*, windchill_*, polarion_* and svn_* tool was absent. The only
+            # remedy left was a Claude Desktop restart, which is the thing this tool exists to avoid --
+            # and which did not fix it either.
+            #
+            # Safe here: discovery is additive only, so it can never remove a working backend, and it
+            # never raises. The worst case is that it adds nothing, which is today's behaviour anyway.
+            global _BACKENDS
+            before = {b.name for b in _BACKENDS}
+            _BACKENDS = _discover_backends(_BACKENDS)
+            appeared = sorted({b.name for b in _BACKENDS} - before)
+            if appeared:
+                # A backend that has just appeared has no auth directive yet, so resolve one before its
+                # catalogue is fetched -- otherwise its /tools call goes out on the wrong scheme and the
+                # reload reports it as a failure rather than adding its tools.
+                _apply_auth_directives_async(_BACKENDS, block=True, allow_interactive=False)
+                _log_event("discovery_recovered_backends", appeared=appeared,
+                           total_backends=len(_BACKENDS))
             r = _apply_catalogue_reload()
+            r["backends_appeared"] = appeared
 
         # v3.5.2 - reprobe OIDC directives OFF the event loop (background daemon)
         # and NON-interactively: a shim_reload must never block the conversation
