@@ -807,15 +807,23 @@ def _local_windows_upn() -> str | None:
 
 def _query_auth_mode(base_url: str, upn: str) -> str:
     """Ask the server which auth this user should use. Kerberos-independent
-    (unauthenticated GET). Returns 'oidc' ONLY on an explicit 200 'oidc';
-    everything else (non-200, non-'oidc' body, network error) -> 'kerberos'."""
+    (unauthenticated GET). Returns 'oidc' ONLY on an explicit 200 'oidc'.
+    Any HTTP answer that is not that (non-200, non-'oidc' body) -> 'kerberos'.
+
+    v3.6.2 - NO answer at all (timeout, connection error) -> 'unknown'. Before,
+    that also returned 'kerberos', so a server that was merely busy for 5s
+    (2026-09-14: the Zabbix adapter's event loop blocked by a 90s extract)
+    pinned the backend to Kerberos for the whole session, silently and with
+    fell_back=False. Callers still treat anything but 'oidc' as "stay on
+    negotiate"; 'unknown' only lets them record that it was not a decision."""
     try:
         r = httpx.get(base_url.rstrip("/") + "/auth/mode",
                       params={"upn": upn}, timeout=5.0)
-        if r.status_code == 200 and r.text.strip().lower() == "oidc":
-            return "oidc"
     except Exception as e:
         _log_event("auth_mode_query_failed", level=logging.WARNING, error=str(e))
+        return "unknown"
+    if r.status_code == 200 and r.text.strip().lower() == "oidc":
+        return "oidc"
     return "kerberos"
 
 
@@ -870,6 +878,11 @@ class Backend:
     effective_auth: str = ""
     _oidc_upn: str = ""   # the local UPN the decision function resolved (Task 4)
     _fell_back: bool = False   # directed oidc but fell back to negotiate this session
+    # v3.6.2 - /auth/mode gave NO answer (timeout / network error) on the last
+    # directive pass, so this backend sits on negotiate by default, not by
+    # directive. A Kerberos 401 on such a backend re-asks /auth/mode and moves
+    # to OIDC only if the server now CONFIRMS "oidc" (_heal_unknown_directive).
+    _directive_unknown: bool = False
 
     def __post_init__(self):
         self.url = self.url.rstrip("/")
@@ -1012,7 +1025,15 @@ def _apply_auth_directives(backends: list[Backend], *, block: bool = True,
             b.effective_auth = b.auth   # negotiate
             b._oidc_upn = ""
             b._fell_back = False
+            b._directive_unknown = False
             directive = _query_auth_mode(b.url, upn)
+            if directive == "unknown":
+                b._directive_unknown = True
+                _log_event("auth_mode_unknown", level=logging.WARNING,
+                           backend=b.name, upn=upn,
+                           note="no /auth/mode answer; staying on negotiate, "
+                                "will re-ask on the first Kerberos 401")
+                continue
             if directive != "oidc":
                 continue
             try:
@@ -2611,6 +2632,52 @@ def _enrich_response(payload: Any, *, http_status: int,
 # ---------------------------------------------------------------------------
 
 
+def _heal_unknown_directive(backend: "Backend") -> bool:
+    """v3.6.2 - a backend whose directive was UNKNOWN just got a Kerberos 401.
+    Re-ask /auth/mode. Move it to OIDC only when the server now confirms "oidc"
+    AND a token can be minted silently. Returns True if it switched.
+
+    Confirm-before-switch is preserved: no answer again keeps negotiate (and
+    the unknown flag, so a later 401 can re-ask); an explicit non-"oidc" answer
+    clears the flag, because that IS a decision. Non-blocking on the directive
+    lock so it never waits on a startup pass (which may hold an interactive
+    sign-in)."""
+    if not _AUTH_DIRECTIVE_LOCK.acquire(blocking=False):
+        _log_event("auth_mode_selfheal_busy", level=logging.INFO, backend=backend.name)
+        return False
+    try:
+        if not backend._directive_unknown or backend.auth != "negotiate":
+            return False
+        upn = _local_windows_upn()
+        if not upn:
+            return False
+        directive = _query_auth_mode(backend.url, upn)
+        if directive == "unknown":
+            return False
+        backend._directive_unknown = False
+        if directive != "oidc":
+            _log_event("auth_mode_selfheal_confirmed_kerberos", level=logging.INFO,
+                       backend=backend.name, upn=upn)
+            return False
+        try:
+            _oidc_acquire_token(upn, allow_interactive=False)
+        except Exception as e:
+            # Directed to OIDC but no token: same state the startup pass records.
+            backend._fell_back = True
+            _log_event("auth_mode_selfheal_token_failed", level=logging.WARNING,
+                       backend=backend.name, upn=upn, error=f"{type(e).__name__}: {e}")
+            return False
+        # Same publish order as _apply_auth_directives: upn before the mode flip.
+        backend._oidc_upn = upn
+        backend._fell_back = False
+        backend.effective_auth = "oidc"
+        _log_event("auth_mode_selfheal_to_oidc", level=logging.WARNING,
+                   backend=backend.name, upn=upn)
+        return True
+    finally:
+        _AUTH_DIRECTIVE_LOCK.release()
+
+
 def _call_remote(registered_name: str, kwargs: dict) -> str:
     """Forward the call to the backend that owns this registered name.
     Returns a JSON string for MCP."""
@@ -2741,6 +2808,15 @@ def _call_remote(registered_name: str, kwargs: dict) -> str:
         backend._fell_back = True
         backend.effective_auth = "negotiate"
         r, err, oidc_broke = _post_once(force_auth="negotiate")
+    elif (not oidc_first and first_mode == "negotiate"
+          and backend._directive_unknown
+          and r is not None and r.status_code == 401):
+        # v3.6.2 - the mirror case. This backend is on Kerberos only because
+        # /auth/mode did not answer at startup, and Kerberos just failed. If the
+        # server now confirms OIDC, switch and retry this call once over OIDC.
+        # 403 is not retried (authorization, same as above).
+        if _heal_unknown_directive(backend):
+            r, err, oidc_broke = _post_once(force_auth="oidc")
 
     if err is not None:
         return err
@@ -3061,6 +3137,7 @@ async def shim_info(ctx: Context) -> str:
                 "effective_auth":         eff,
                 "oidc_upn":               (b._oidc_upn or None) if eff == "oidc" else None,
                 "fell_back":              b._fell_back,
+                "auth_directive_unknown": b._directive_unknown,
                 "header":                 b.header if b.auth == "x-punch-auth" else None,
                 "configured":             b.is_configured,
                 "registered_tool_count":  tool_count,
