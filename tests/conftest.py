@@ -62,3 +62,16 @@ def backends_cfg(_isolate_shim_env):
     """Per-test handle to the isolated backends.json — tests rewrite this
     file to simulate a key rotation, then call _maybe_reload_backends."""
     return _isolate_shim_env
+
+
+@pytest.fixture(autouse=True)
+def _drain_auth_flip_queue():
+    """v3.6.2 — _apply_auth_directives queues every backend it newly flips to
+    OIDC for a /tools re-fetch on the next tool call. Tests that exercise the
+    directive leave names in that module-level queue; drain it after each test
+    so a later _call_remote test does not run a stray catalogue rebuild."""
+    yield
+    import sys
+    shim = sys.modules.get("shim_server")
+    if shim is not None and hasattr(shim, "_AUTH_FLIP_PENDING"):
+        shim._AUTH_FLIP_PENDING.clear()
