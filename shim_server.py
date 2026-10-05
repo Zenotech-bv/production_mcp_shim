@@ -194,7 +194,10 @@ from mcp.server.fastmcp import Context, FastMCP
 # launch, so the env converges with no per-laptop action. Best-effort +
 # idempotent; never blocks startup. Logic change, but no behaviour change for
 # an already-fixed (v3.4.3+) manifest — it's a no-op there.
-_SHIM_VERSION = "3.6.1"
+_SHIM_VERSION = "3.6.2"
+# v3.6.2 — a backend the background OIDC directive flips to "oidc" is re-fetched
+# on the next tool call. Before, its startup /tools fetch (sent on negotiate,
+# before the flip) got 401 and the backend kept 0 tools until shim_reload.
 # v3.6.1 — FIX a v3.6.0 regression found on first install (2026-07-16): v3.6.0
 #          deferred supervisor discovery to the background warmup on the false
 #          assumption that backends.json carries the core backends. It does not:
@@ -964,6 +967,16 @@ class Backend:
 
 _AUTH_DIRECTIVE_LOCK = threading.Lock()
 
+# v3.6.2 - names of backends the directive has just flipped to "oidc". The
+# startup /tools fetch runs on the static auth BEFORE this background pass, so an
+# OIDC-only backend (render-adapter, rd, soc) answers it 401 and registers 0
+# tools. /health does not change when the auth does, so the catalogue watcher
+# would never re-fetch. _maybe_refresh_catalogue drains this set on the event-loop
+# thread and re-fetches exactly these backends. Written on the OIDC daemon
+# thread, so it never touches the FastMCP registry itself.
+_AUTH_FLIP_PENDING: set[str] = set()
+_AUTH_FLIP_LOCK = threading.Lock()
+
 
 def _apply_auth_directives(backends: list[Backend], *, block: bool = True,
                            allow_interactive: bool = True) -> list[Backend]:
@@ -995,6 +1008,7 @@ def _apply_auth_directives(backends: list[Backend], *, block: bool = True,
             # oidc->kerberos would leave a stale effective_auth="oidc" (or a stale
             # _fell_back=True) from a prior pass, since the `directive != "oidc"`
             # continue below never reaches the assignment that would clear it.
+            was_oidc = b.effective_auth == "oidc"
             b.effective_auth = b.auth   # negotiate
             b._oidc_upn = ""
             b._fell_back = False
@@ -1015,6 +1029,11 @@ def _apply_auth_directives(backends: list[Backend], *, block: bool = True,
                 b._fell_back = False
                 b.effective_auth = "oidc"
                 _log_event("oidc_cutover_confirmed", backend=b.name, upn=upn)
+                # Only a NEW flip queues a re-fetch: a shim_reload reprobe that
+                # keeps oidc must not cost a second /tools round trip.
+                if not was_oidc:
+                    with _AUTH_FLIP_LOCK:
+                        _AUTH_FLIP_PENDING.add(b.name)
             except Exception as e:
                 b.effective_auth = "negotiate"     # fail-safe: stay on Kerberos this session
                 b._fell_back = True
@@ -2341,7 +2360,7 @@ except Exception as _e:
         pass
 
 
-def _reload_registry() -> tuple[
+def _reload_registry(only: "set[str] | None" = None) -> tuple[
     dict[str, tuple["Backend", str]],
     list[tuple[str, dict, "Backend"]],
     list[str],
@@ -2352,10 +2371,15 @@ def _reload_registry() -> tuple[
     previously-known tools — a transient fetch failure must never silently
     unregister a whole backend's catalogue. Returns
     (name_to_backend, registrations, fetch_failures).
+
+    `only` (v3.6.2) limits the re-fetch to those backend names; every other
+    backend keeps the tools it has, and the registry is still rebuilt whole.
     """
     fetch_failures: list[str] = []
     for backend in _BACKENDS:
         if not backend.is_configured:
+            continue
+        if only is not None and backend.name not in only:
             continue
         fresh = _fetch_tools_for_backend(backend)
         if fresh:                          # non-empty list — adopt it
@@ -2420,7 +2444,7 @@ def _probe_catalogue_stamp(backend: "Backend") -> tuple | None:
     return (ver, tools)
 
 
-def _apply_catalogue_reload() -> dict:
+def _apply_catalogue_reload(only: "set[str] | None" = None) -> dict:
     """Re-fetch every backend's /tools and update FastMCP registrations in
     place. SYNC — does NOT notify the client. Returns a summary with
     added/removed/changed (sorted), total, fetch_failures, register_failures,
@@ -2429,7 +2453,7 @@ def _apply_catalogue_reload() -> dict:
     global _NAME_TO_BACKEND, _REGISTRATIONS
     old_tool_by_name = {name: tool for name, tool, _b in _REGISTRATIONS}
 
-    new_name_to_backend, new_registrations, fetch_failures = _reload_registry()
+    new_name_to_backend, new_registrations, fetch_failures = _reload_registry(only)
     new_tool_by_name    = {name: tool for name, tool, _b in new_registrations}
     new_backend_by_name = {name: b for name, _t, b in new_registrations}
 
@@ -2479,6 +2503,23 @@ def _maybe_refresh_catalogue() -> dict | None:
     call: throttled, and any probe failure is skipped so the working catalogue
     is never disturbed."""
     global _LAST_CATALOGUE_PROBE_MONO
+
+    # v3.6.2 - a backend the OIDC directive flipped since the last call got its
+    # startup /tools on the old auth (a 401 for an OIDC-only backend). Re-fetch
+    # just those, now, ignoring the /health throttle: /health did not change.
+    with _AUTH_FLIP_LOCK:
+        flipped = set(_AUTH_FLIP_PENDING)
+        _AUTH_FLIP_PENDING.clear()
+    if flipped:
+        with _BACKENDS_RELOAD_LOCK:
+            result = _apply_catalogue_reload(only=flipped)
+        _log_event("catalogue_refetched_after_oidc_flip",
+                   backends=sorted(flipped),
+                   added=result["added"], removed=result["removed"],
+                   changed=result["changed"], total=result["total"],
+                   fetch_failures=result["fetch_failures"],
+                   register_failures=result["register_failures"])
+        return result
 
     now = time.monotonic()
     if now - _LAST_CATALOGUE_PROBE_MONO < _CATALOGUE_PROBE_THROTTLE_S:
