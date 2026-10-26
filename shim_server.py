@@ -119,6 +119,7 @@ New in v2.3.1:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -137,9 +138,12 @@ from pathlib import Path
 from typing import Any, Generator
 from urllib.parse import urlparse
 
+import anyio
 import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.lowlevel import NotificationOptions
+from mcp.server.stdio import stdio_server
 
 # ---------------------------------------------------------------------------
 # Shim self-version. Bump alongside MCPB version (manifest.json::version).
@@ -194,7 +198,13 @@ from mcp.server.fastmcp import Context, FastMCP
 # launch, so the env converges with no per-laptop action. Best-effort +
 # idempotent; never blocks startup. Logic change, but no behaviour change for
 # an already-fixed (v3.4.3+) manifest — it's a no-op there.
-_SHIM_VERSION = "3.6.2"
+_SHIM_VERSION = "3.6.3"
+# v3.6.3 — tool-list changes reach the client (backlog CAT-2). `initialize` now
+# advertises tools.listChanged=true (the SDK default said false: "this list
+# never changes"), and the auto-refresh sends notifications/tools/list_changed
+# whenever it moves the catalogue — before, only a manual shim_reload did. Also
+# the first release since 3.6.1 whose manifest.json sha256 matches this file:
+# 3.6.2's did not, so every laptop refused it (auto_update_fail sha256_mismatch).
 # v3.6.2 — a backend the background OIDC directive flips to "oidc" is re-fetched
 # on the next tool call. Before, its startup /tools fetch (sent on negotiate,
 # before the flip) got 401 and the backend kept 0 tools until shim_reload.
@@ -2407,10 +2417,11 @@ def _reload_registry(only: "set[str] | None" = None) -> tuple[
 # chat / reconnect) returns. It also recovers a shim that soft-failed its
 # startup /tools fetch (backend briefly down): the next probe re-fetches.
 #
-# Notification caveat: the rebuild is synchronous (the FastMCP forwarders are
-# sync, ctx-less), so it does NOT push tools/list_changed to the *current*
-# conversation — a new chat picks up the fresh catalogue automatically. Manual
-# `shim_reload` remains for an instant in-conversation refresh.
+# v3.6.3 — the rebuild runs inside a sync forwarder, on the event-loop thread
+# and inside the MCP request, so _notify_tools_list_changed can queue
+# notifications/tools/list_changed on that loop; it goes out as soon as the
+# forwarder returns. Before v3.6.3 the refresh was silent: a client that had
+# cached the list never heard about the change (2026-10-25, backlog CAT-2).
 # ---------------------------------------------------------------------------
 
 _CATALOGUE_PROBE_THROTTLE_S = float(os.getenv("PUNCH_SHIM_CATALOGUE_PROBE_S", "30"))
@@ -2448,8 +2459,8 @@ def _apply_catalogue_reload(only: "set[str] | None" = None) -> dict:
     """Re-fetch every backend's /tools and update FastMCP registrations in
     place. SYNC — does NOT notify the client. Returns a summary with
     added/removed/changed (sorted), total, fetch_failures, register_failures,
-    and `moved` (the catalogue changed). Shared by shim_reload (which adds the
-    client notification) and the auto-refresh watcher (which does not)."""
+    and `moved` (the catalogue changed). Shared by shim_reload and the
+    auto-refresh watcher; each notifies the client itself when `moved`."""
     global _NAME_TO_BACKEND, _REGISTRATIONS
     old_tool_by_name = {name: tool for name, tool, _b in _REGISTRATIONS}
 
@@ -2519,6 +2530,8 @@ def _maybe_refresh_catalogue() -> dict | None:
                    changed=result["changed"], total=result["total"],
                    fetch_failures=result["fetch_failures"],
                    register_failures=result["register_failures"])
+        if result["moved"]:
+            _notify_tools_list_changed("oidc_flip_refetch")
         return result
 
     now = time.monotonic()
@@ -2549,7 +2562,49 @@ def _maybe_refresh_catalogue() -> dict | None:
                changed=result["changed"], total=result["total"],
                fetch_failures=result["fetch_failures"],
                register_failures=result["register_failures"])
+    if result["moved"]:
+        _notify_tools_list_changed("auto_refresh")
     return result
+
+
+# Strong refs to queued list_changed sends: the event loop keeps only weak refs
+# to tasks, so an unreferenced one can be dropped before it runs.
+_LIST_CHANGED_SENDS: set = set()
+
+
+def _notify_tools_list_changed(reason: str) -> bool:
+    """Queue notifications/tools/list_changed to the client of the MCP request
+    in progress. Returns True if queued.
+
+    Callers are the sync tool forwarders, which mcp runs as a bare fn(...) ON
+    the event-loop thread, inside the request — so the session is in the
+    request context and the send can be scheduled as a task on the running
+    loop. It goes out once the forwarder returns control to the loop.
+    Outside a request (no session, or no running loop on this thread) the
+    notification is skipped and logged. Never raises."""
+    try:
+        session = mcp.get_context().session
+        loop = asyncio.get_running_loop()
+    except (ValueError, LookupError, RuntimeError) as e:
+        _log_event("tools_list_changed_skipped", reason=reason,
+                   error=f"{type(e).__name__}: {e}")
+        return False
+    task = loop.create_task(session.send_tool_list_changed())
+    _LIST_CHANGED_SENDS.add(task)
+    task.add_done_callback(_on_list_changed_sent)
+    _log_event("tools_list_changed_queued", reason=reason,
+               client=_client_name(), pid=os.getpid())
+    return True
+
+
+def _on_list_changed_sent(task: "asyncio.Task") -> None:
+    _LIST_CHANGED_SENDS.discard(task)
+    if task.cancelled():
+        return
+    e = task.exception()
+    if e is not None:
+        _log_event("tools_list_changed_failed", level=logging.WARNING,
+                   error=f"{type(e).__name__}: {e}")
 
 
 # v3.6.0 — the catalogue-stamp seed (a GET /health per backend, 5s each) moved
@@ -2799,7 +2854,25 @@ def _call_remote(registered_name: str, kwargs: dict) -> str:
 # FastMCP registration
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("Punch Analytics — Punch Powertrain (federated client)")
+def _client_name() -> str | None:
+    """clientInfo.name of the client in the MCP request in progress, else None."""
+    try:
+        return mcp.get_context().session.client_params.clientInfo.name
+    except Exception:
+        return None
+
+
+class _ShimFastMCP(FastMCP):
+    async def list_tools(self):
+        """v3.6.3 — log every tools/list answered, so the shim log shows whether
+        a client re-pulled the list after a list_changed (backlog CAT-2)."""
+        tools = await super().list_tools()
+        _log_event("tools_list_served", tool_count=len(tools),
+                   client=_client_name(), pid=os.getpid())
+        return tools
+
+
+mcp = _ShimFastMCP("Punch Analytics — Punch Powertrain (federated client)")
 
 
 def _make_forwarder(registered_name: str):
@@ -3265,6 +3338,22 @@ def _start_background_warmup() -> "threading.Thread | None":
 # Entry
 # ---------------------------------------------------------------------------
 
+def _initialization_options():
+    """What the shim answers `initialize` with. v3.6.3: tools.listChanged=true.
+    The shim does change its tool list (auto-refresh, shim_reload) and notifies;
+    FastMCP's default (False) told every client the list never changes.
+    FastMCP (mcp 1.27) has no public hook for NotificationOptions, hence the
+    private _mcp_server."""
+    return mcp._mcp_server.create_initialization_options(
+        NotificationOptions(tools_changed=True))
+
+
+async def _run_stdio() -> None:
+    """FastMCP.run_stdio_async, with _initialization_options()."""
+    async with stdio_server() as (read_stream, write_stream):
+        await mcp._mcp_server.run(read_stream, write_stream, _initialization_options())
+
+
 if __name__ == "__main__":
     _log_event(
         "shim_ready",
@@ -3277,4 +3366,4 @@ if __name__ == "__main__":
     # in the background, then start serving immediately. Only in __main__ (a real
     # launch) — importing the module for tests never spawns it.
     _start_background_warmup()
-    mcp.run(transport="stdio")
+    anyio.run(_run_stdio)

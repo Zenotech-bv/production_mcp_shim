@@ -30,14 +30,17 @@ verification before `os.replace`).
 
 ## How updates ship
 
-1. Edit `shim_server.py` in the main monorepo at
-   `sap-analytics-mcp-server/server/shim_canonical/shim_server.py`.
-   Bump `_SHIM_VERSION = "X.Y.Z"`.
-2. Run `operational/publish-shim-to-github.ps1` from the main repo.
-   The script computes the sha256, regenerates `manifest.json`,
-   commits both files here, and pushes to `main`.
-3. Every laptop with auto-update enabled picks up the new shim
-   on the next Claude Desktop bounce.
+1. Edit `shim_server.py` here and bump `_SHIM_VERSION = "X.Y.Z"`.
+2. Run `operational/publish-shim-to-github.ps1`. It builds
+   `releases/punch-analytics-X.Y.Z.mcpb`, syncs `manifest.json`
+   (version, sha256, size), commits those three files, tags, pushes
+   `main` and creates the GitHub release. `-DryRun` builds and syncs
+   without committing. Never edit `manifest.json` by hand: v3.6.2 did,
+   kept 3.6.1's sha256, and every laptop refused the update.
+   `tests/test_release_manifest.py` fails on any commit where
+   `manifest.json` and `shim_server.py` disagree.
+3. Every laptop with auto-update enabled stages the new shim and
+   runs it from the next launch of its MCP host.
 
 ## Auto-update behaviour
 
@@ -51,9 +54,9 @@ The shim's `_maybe_self_update()` runs on startup if
 4. If newer, download `shim_server.py`.
 5. Verify sha256 against the manifest.
 6. Backup the current shim to `shim_server.py.bak`.
-7. Atomic file swap.
-8. `os.execv` re-launches the shim — Claude Desktop sees an
-   uninterrupted MCP session.
+7. Atomic file swap. The running shim keeps its old code; the new
+   file runs from the next launch (v3.5.1: no `os.execv` on Windows,
+   it broke Claude Desktop's stdio pipe).
 
 ## Safety
 
@@ -65,6 +68,22 @@ The shim's `_maybe_self_update()` runs on startup if
   shim_server.py` followed by a Claude Desktop restart.
 - **Two trust gradients**: GitHub HTTPS (this repo, primary) +
   internal server X-Punch-Auth (fallback). Either is sufficient.
+
+## Tool-list changes (v3.3.0, v3.6.3)
+
+A backend deploy that adds, drops or changes a tool is picked up
+without a restart. On a tool call (throttled by
+`PUNCH_SHIM_CATALOGUE_PROBE_S`, default 30 s) the shim compares each
+backend's `/health` version and tool count with what it last saw. On a
+change it re-fetches `/tools` and re-registers the tools in place.
+
+Since v3.6.3 the client is told: `initialize` advertises
+`tools.listChanged: true`, and every refresh that moves the catalogue
+sends `notifications/tools/list_changed` (before, only a manual
+`shim_reload` did). Each `tools/list` the shim answers is logged as
+`tools_list_served` (tool count, client name, pid), so `shim.log`
+shows whether a client re-pulled the list after the notification
+(`tools_list_changed_queued`).
 
 ## Hot-reload of `backends.json` (v2.3.1)
 
@@ -87,9 +106,10 @@ already carries the new key. **No Claude Desktop restart, no manual
 What's hot-applied: `key`, `url`, `header` on a backend whose `name`
 was already known at startup.
 
-What still needs `shim_reload` (added/removed tools) or Claude Desktop
-restart (added/removed/renamed backend): structural changes to the
-backend list. The shim logs a `backends_structural_change_detected`
+Added/removed tools are handled by the auto-refresh (see "Tool-list
+changes"). What still needs `shim_reload` or a restart of the MCP host
+(added/removed/renamed backend): structural changes to the backend
+list. The shim logs a `backends_structural_change_detected`
 WARN event so the operator sees a clear signal.
 
 Tunables:
