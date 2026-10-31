@@ -43,6 +43,10 @@ For every tool ``T`` from backend ``B``:
 The collision-only-strips-bare rule means single-backend deployments
 behave exactly as before — every tool keeps its original name.
 
+Two backends on the same URL are one server, not a collision: since
+v3.6.4 the second one (from backends.json or discovery) is skipped, so
+its catalogue is not registered twice under two prefixes.
+
 ## Soft-fail on backend unreachable
 
 A backend that's unreachable at startup (DNS failure, connection
@@ -198,7 +202,14 @@ from mcp.server.stdio import stdio_server
 # launch, so the env converges with no per-laptop action. Best-effort +
 # idempotent; never blocks startup. Logic change, but no behaviour change for
 # an already-fixed (v3.4.3+) manifest — it's a no-op there.
-_SHIM_VERSION = "3.6.3"
+_SHIM_VERSION = "3.6.4"
+# v3.6.4 — one backend per URL. Discovery advertises pa_v2 as "sap"; a
+# backends.json listing the same :3000 URL as "pa_v2" kept both (merges keyed on
+# the name only), so the registry saw every pa_v2 tool twice and registered both
+# prefixed forms: registered_count 485, collision_count 239. A backend whose
+# normalised URL (_normalise_backend_url) is already loaded — from backends.json
+# or from discovery — is now skipped with one backend_duplicate_url_skipped line.
+# Same-name tools on DIFFERENT URLs still collide and get prefixed as before.
 # v3.6.3 — tool-list changes reach the client (backlog CAT-2). `initialize` now
 # advertises tools.listChanged=true (the SDK default said false: "this list
 # never changes"), and the auto-refresh sends notifications/tools/list_changed
@@ -1098,6 +1109,21 @@ def _resolve_backends_path() -> Path:
     return Path.home() / ".config" / "punch" / "backends.json"
 
 
+def _normalise_backend_url(url: str) -> str:
+    """Comparison key for "is this the same backend?" — scheme, host, port and
+    path; scheme + host case-insensitive; no trailing slash. Used to skip a
+    second backend on a URL already loaded (v3.6.4). Never raises: an
+    unparseable URL compares as its stripped, case-folded text."""
+    try:
+        p = urlparse(url.strip())
+        host = (p.hostname or "").lower()
+        port = p.port
+    except ValueError:
+        return url.strip().rstrip("/").lower()
+    netloc = f"{host}:{port}" if port is not None else host
+    return f"{p.scheme.lower()}://{netloc}{p.path.rstrip('/')}"
+
+
 def _load_backends_from_file(path: Path) -> tuple[list[Backend], str | None]:
     """Parse backends.json. Returns (list_of_backends, primary_name).
     Logs+raises on malformed files (caller should soft-fail to env-var
@@ -1116,6 +1142,7 @@ def _load_backends_from_file(path: Path) -> tuple[list[Backend], str | None]:
 
     backends: list[Backend] = []
     seen_names: set[str] = set()
+    seen_urls: dict[str, str] = {}   # normalised url -> name of the entry that owns it
     for i, entry in enumerate(raw_backends):
         if not isinstance(entry, dict):
             _log_event("backends_entry_skipped", level=logging.WARNING,
@@ -1156,6 +1183,13 @@ def _load_backends_from_file(path: Path) -> tuple[list[Backend], str | None]:
             _log_event("backends_entry_skipped", level=logging.WARNING,
                        index=i, name=name, reason="duplicate_name")
             continue
+        norm_url = _normalise_backend_url(url)
+        if norm_url in seen_urls:
+            _log_event("backend_duplicate_url_skipped", level=logging.WARNING,
+                       backend=name, duplicate_of=seen_urls[norm_url], url=url,
+                       source="config_file")
+            continue
+        seen_urls[norm_url] = name
         seen_names.add(name)
         backends.append(Backend(name=name, url=url, header=header, key=key, auth=auth))
 
@@ -1705,7 +1739,11 @@ def _discover_backends(backends: list[Backend]) -> list[Backend]:
     """Merge supervisor-discovered backends into `backends`, additive-only.
 
     Appends any discovered backend whose name is not already present; a
-    name already loaded locally is never overridden. Best-effort: when
+    name already loaded locally is never overridden. v3.6.4: a discovered
+    backend whose normalised URL is already loaded is skipped too — the
+    supervisor advertises pa_v2 as "sap" while a laptop's backends.json may
+    list the same :3000 URL as "pa_v2", and keeping both registered the whole
+    pa_v2 catalogue twice (485 tools, 239 collisions). Best-effort: when
     discovery is unavailable (`_fetch_discovery` -> None) or the payload
     is malformed, `backends` is returned unchanged. Discovery never blocks
     startup and never shrinks the backend set."""
@@ -1719,6 +1757,7 @@ def _discover_backends(backends: list[Backend]) -> list[Backend]:
         return backends
 
     known = {b.name for b in backends}
+    known_urls = {_normalise_backend_url(b.url): b.name for b in backends}
     result = list(backends)
     added: list[str] = []
     for entry in discovered:
@@ -1733,7 +1772,14 @@ def _discover_backends(backends: list[Backend]) -> list[Backend]:
             continue
         if name in known:
             continue                       # additive-only: local always wins
+        norm_url = _normalise_backend_url(url)
+        if norm_url in known_urls:
+            _log_event("backend_duplicate_url_skipped", level=logging.WARNING,
+                       backend=name, duplicate_of=known_urls[norm_url], url=url,
+                       source="discovery")
+            continue
         known.add(name)
+        known_urls[norm_url] = name
         result.append(Backend(name=name, url=url, header="X-Punch-Auth",
                               key="", auth=auth))
         added.append(name)
