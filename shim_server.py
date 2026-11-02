@@ -198,7 +198,12 @@ from mcp.server.stdio import stdio_server
 # launch, so the env converges with no per-laptop action. Best-effort +
 # idempotent; never blocks startup. Logic change, but no behaviour change for
 # an already-fixed (v3.4.3+) manifest — it's a no-op there.
-_SHIM_VERSION = "3.6.3"
+_SHIM_VERSION = "3.6.4"
+# v3.6.4 — a failed supervisor discovery no longer shrinks the backend set. Each
+# good answer is saved (discovered_backends.json, beside the catalogue cache) and
+# a failed one falls back to it, so a timeout at start no longer leaves the
+# session on sap + zabbix (312 of 405 tools) until a tray Quit. Also carries
+# 268eac1: every discovery outcome is logged, and shim_reload re-runs discovery.
 # v3.6.3 — tool-list changes reach the client (backlog CAT-2). `initialize` now
 # advertises tools.listChanged=true (the SDK default said false: "this list
 # never changes"), and the auto-refresh sends notifications/tools/list_changed
@@ -1678,6 +1683,83 @@ _DISCOVERY_URL = os.environ.get(
     "http://ai.punchpowertrain.com:3030/api/discover/backends",
 )
 _DISCOVERY_TIMEOUT_S = 3.0
+# v3.6.4 — the last good discovery answer is saved to disk, and a failed discovery
+# falls back to it. A failed GET used to start the shim on backends.json alone
+# (sap + zabbix: 312 tools of 405), and Claude Desktop ignores
+# notifications/tools/list_changed (proven with 3.6.3), so rd, soc and tutorials
+# stayed missing for the whole Desktop session. No retry and no longer timeout:
+# with the saved set a failure costs nothing, while every extra second here
+# delays `initialize` on each failed start (the v3.6.0 fast-start rule).
+_DISCOVERED_BACKENDS_VERSION = 1
+
+
+def _discovered_backends_path() -> Path:
+    """Where the last good discovery answer is saved — beside the catalogue cache
+    under %LOCALAPPDATA%\\PunchAnalytics (test-isolated via _resolve_log_dir)."""
+    return _resolve_log_dir() / "discovered_backends.json"
+
+
+def _valid_discovery_entries(raw: Any) -> list[dict]:
+    """The usable {name, url, auth} entries of a discovery `backends` array,
+    normalised. Entries without a name or url are skipped and logged. A
+    non-string value counts as missing: this also reads the saved file at
+    import, where a raise would stop the shim from starting."""
+    def _s(v: Any) -> str:
+        return v.strip() if isinstance(v, str) else ""
+
+    entries: list[dict] = []
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        name = _s(entry.get("name"))
+        url = _s(entry.get("url"))
+        auth = (_s(entry.get("auth")) or "x-punch-auth").lower()
+        if not name or not url:
+            _log_event("discovery_entry_skipped", level=logging.WARNING,
+                       reason="missing_name_or_url")
+            continue
+        entries.append({"name": name, "url": url, "auth": auth})
+    return entries
+
+
+def _save_discovered_backends(entries: list[dict]) -> None:
+    """Save a good discovery answer. It REPLACES the saved set, so a backend the
+    supervisor retires (render, 2026-11-02) does not come back from disk. Written
+    to a temp file and renamed, so a shim starting at the same moment never reads
+    half a file. Best-effort; never raises."""
+    payload = {
+        "cache_version": _DISCOVERED_BACKENDS_VERSION,
+        "discovery_url": _DISCOVERY_URL,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "backends": entries,
+    }
+    path = _discovered_backends_path()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as e:
+        _log_event("discovered_backends_save_failed", level=logging.WARNING,
+                   error=f"{type(e).__name__}: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _load_discovered_backends() -> tuple[list[dict], str] | None:
+    """The saved set as (entries, saved_at), or None if absent / unreadable / a
+    different version / saved from a different discovery URL. Never raises."""
+    try:
+        data = json.loads(_discovered_backends_path().read_text(encoding="utf-8"))
+    except Exception:   # absent, locked, not JSON, too deep: all mean "no saved set"
+        return None
+    if (not isinstance(data, dict)
+            or data.get("cache_version") != _DISCOVERED_BACKENDS_VERSION
+            or data.get("discovery_url") != _DISCOVERY_URL):
+        return None
+    entries = _valid_discovery_entries(data.get("backends"))
+    return (entries, str(data.get("saved_at") or "")) if entries else None
 
 
 def _fetch_discovery() -> dict | None:
@@ -1714,46 +1796,59 @@ def _discover_backends(backends: list[Backend]) -> list[Backend]:
     Appends any discovered backend whose name is not already present; a
     name already loaded locally is never overridden. Best-effort: when
     discovery is unavailable (`_fetch_discovery` -> None) or the payload
-    is malformed, `backends` is returned unchanged. Discovery never blocks
-    startup and never shrinks the backend set."""
+    is malformed, the last good answer saved on disk is merged instead
+    (v3.6.4); with no saved answer `backends` is returned unchanged. Discovery
+    never blocks startup and never shrinks the backend set."""
     payload = _fetch_discovery()
-    if payload is None:
-        _log_event("discovery_unavailable", level=logging.WARNING,
-                   backends=[b.name for b in backends],
-                   note="running on the local backend list only; a discovered backend registers no tools")
-        return backends
-    discovered = payload.get("backends")
-    if not isinstance(discovered, list):
-        _log_event("discovery_skipped", level=logging.WARNING,
-                   reason="no_backends_array", url=_DISCOVERY_URL)
-        return backends
+    entries: list[dict] = []
+    if payload is not None:
+        discovered = payload.get("backends")
+        if not isinstance(discovered, list):
+            _log_event("discovery_skipped", level=logging.WARNING,
+                       reason="no_backends_array", url=_DISCOVERY_URL)
+        else:
+            entries = _valid_discovery_entries(discovered)
+            if not entries:
+                # An empty list is a supervisor fault, not "no backends exist":
+                # saving it would wipe the good set.
+                _log_event("discovery_skipped", level=logging.WARNING,
+                           reason="no_usable_backend", url=_DISCOVERY_URL)
+    source = "live"
+    if entries:
+        _save_discovered_backends(entries)
+    else:
+        # Disabled discovery means "backends.json only" (tests, ops escape hatch),
+        # so the saved set is used only when discovery is on and failed.
+        saved = _load_discovered_backends() if _DISCOVERY_URL else None
+        if saved is None:
+            if payload is None:
+                _log_event("discovery_unavailable", level=logging.WARNING,
+                           backends=[b.name for b in backends],
+                           note="running on the local backend list only; a discovered backend registers no tools")
+            return backends
+        entries, saved_at = saved
+        source = "saved"
+        _log_event("discovery_used_saved_set", level=logging.WARNING,
+                   backends=[e["name"] for e in entries], saved_at=saved_at,
+                   note="the supervisor did not answer; using the last backend set it gave")
 
     known = {b.name for b in backends}
     result = list(backends)
     added: list[str] = []
-    for entry in discovered:
-        if not isinstance(entry, dict):
-            continue
-        name = (entry.get("name") or "").strip()
-        url = (entry.get("url") or "").strip()
-        auth = (entry.get("auth") or "x-punch-auth").strip().lower()
-        if not name or not url:
-            _log_event("discovery_entry_skipped", level=logging.WARNING,
-                       reason="missing_name_or_url")
-            continue
-        if name in known:
+    for e in entries:
+        if e["name"] in known:
             continue                       # additive-only: local always wins
-        known.add(name)
-        result.append(Backend(name=name, url=url, header="X-Punch-Auth",
-                              key="", auth=auth))
-        added.append(name)
+        known.add(e["name"])
+        result.append(Backend(name=e["name"], url=e["url"], header="X-Punch-Auth",
+                              key="", auth=e["auth"]))
+        added.append(e["name"])
     if added:
-        _log_event("discovery_merged", added=added, total_backends=len(result))
+        _log_event("discovery_merged", added=added, total_backends=len(result), source=source)
     else:
         # ALSO LOGGED. "Discovery ran and added nothing" and "discovery never ran" produced the same
         # silence, and they need entirely different fixes.
         _log_event("discovery_added_nothing", level=logging.INFO,
-                   discovered=[str((e or {}).get("name") or "") for e in discovered if isinstance(e, dict)],
+                   discovered=[e["name"] for e in entries], source=source,
                    already_known=sorted(known), total_backends=len(result))
     return result
 
