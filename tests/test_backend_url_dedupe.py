@@ -1,4 +1,4 @@
-"""Two backends on the same URL are one backend (v3.6.4).
+"""Two backends on the same URL are one backend (v3.6.6).
 
 Discovery advertises pa_v2 as ``sap``; a backends.json that already lists the
 same ``:3000`` URL as ``pa_v2`` kept both, because every merge keyed on the
