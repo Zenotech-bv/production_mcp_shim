@@ -75,22 +75,18 @@ Step "Replace shim_server.py"
 Copy-Item -LiteralPath $canonical -Destination (Join-Path $staging 'server\shim_server.py') -Force
 Ok "shim_server.py updated"
 
-Step "Refresh bundled tools.json (SAP offline fallback)"
-# The bundled tools.json is the SAP backend's offline fallback - loaded ONLY
-# when pa_v2 is unreachable at first launch (otherwise the shim fetches /tools
-# live). It MUST track the live catalogue, NOT be frozen at whatever the
-# baseline .mcpb shipped: the 2.4.1 baseline carried a stale 104-tool V1
-# snapshot (get_vendor_aging, ...) which the v2 backend does not even serve.
-# Copy the repo's canonical tools.json. Regenerate it before a release via:
-#   cd C:\claude\punch-analytics
-#   .\.venv\Scripts\python.exe C:\claude\production_mcp_shim\generate_bundled_tools.py
-$repoTools = Join-Path $repoRoot 'tools.json'
-if (Test-Path $repoTools) {
-    Copy-Item -LiteralPath $repoTools -Destination (Join-Path $staging 'server\tools.json') -Force
-    $tj = Get-Content -Raw $repoTools | ConvertFrom-Json
-    Ok ("tools.json refreshed ({0} tools, server_version {1})" -f $tj.count, $tj.server_version)
+Step "Drop server\tools.json (v3.6.7 - no bundled offline tool fallback)"
+# Up to v3.6.4 the shim registered the names in server\tools.json when the sap
+# backend was unreachable on a cold start. That snapshot never tracked the live
+# catalogue (auto-update replaces only shim_server.py), so laptops got stuck
+# with phantom tools. The shim no longer reads the file, so do not ship it. The
+# 2.4.1 baseline carries one (104 V1 names); remove it from the staging dir.
+$stagedTools = Join-Path $staging 'server\tools.json'
+if (Test-Path $stagedTools) {
+    Remove-Item -LiteralPath $stagedTools -Force
+    Ok "server\tools.json removed from the package"
 } else {
-    Note "no repo tools.json at $repoTools - bundled fallback left as baseline (stale)"
+    Note "baseline has no server\tools.json"
 }
 
 Step "Bundle uv.lock (v3.4.3 - fast, deterministic env build)"
@@ -234,16 +230,22 @@ if ($LongDescription) {
     Note "long_description: manifest-long-description.txt"
 }
 
-# v3.4.2 - sync the declared `tools` array from the bundled tools.json so the
-# connector directory shows the CURRENT catalogue, not the baseline's frozen V1
-# set (the 2.4.1 baseline declared 92 get_* V1 tools the v2 backend never serves).
-$repoToolsJson = Join-Path $repoRoot 'tools.json'
+# v3.4.2 - sync the declared `tools` array from the repo's catalogue snapshot so
+# the connector directory shows the CURRENT catalogue, not the baseline's frozen
+# V1 set (the 2.4.1 baseline declared 92 get_* V1 tools the v2 backend never
+# serves). v3.6.7 - the snapshot is manifest-tools.json (was tools.json). It is
+# directory text only: it is not packaged, and the shim never reads it; the
+# shim registers what each backend's /tools returns. Regenerate before a
+# release with generate_manifest_tools.py (see its docstring).
+$repoToolsJson = Join-Path $repoRoot 'manifest-tools.json'
 if (Test-Path $repoToolsJson) {
     $cat = Get-Content -Raw $repoToolsJson | ConvertFrom-Json
     $man.tools = @($cat.tools | ForEach-Object {
         [pscustomobject]@{ name = $_.name; description = $_.description }
     })
-    Ok ("manifest.tools synced from tools.json ({0} tools)" -f $man.tools.Count)
+    Ok ("manifest.tools synced from manifest-tools.json ({0} tools, pa_v2 {1})" -f $man.tools.Count, $cat.server_version)
+} else {
+    Note "no manifest-tools.json at $repoToolsJson - manifest.tools left as baseline (stale)"
 }
 
 # v3.0.6 — strip `compatibility.runtimes.python`. The bundled `bin/uv.exe`

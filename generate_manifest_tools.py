@@ -1,12 +1,16 @@
-"""Regenerate the shim's bundled offline-fallback tools.json from the live
-pa_v2 catalogue, using the SAME builder GET /tools uses
-(server.dispatcher.list_tools_for_user) so the snapshot is byte-identical in
-shape to what a live fetch would return. The previous bundle held 104 stale V1
-tool names (get_vendor_aging, ...) which the v2 backend does not even serve.
+"""Regenerate manifest-tools.json, the catalogue snapshot build-mcpb.ps1 copies
+into the .mcpb manifest's `tools` array (the text Claude Desktop's connector
+directory shows). Uses the SAME builder GET /tools uses
+(server.dispatcher.list_tools_for_user) so the names match a live fetch.
+
+v3.6.5: this file is directory text only. It is not packaged, and the shim never
+reads it (until v3.6.4 a bundled tools.json was the sap backend's offline tool
+fallback; that fallback is gone). A stale snapshot only makes the directory
+listing stale.
 
 Run from the punch-analytics venv:
   cd C:\\claude\\punch-analytics
-  ./.venv/Scripts/python.exe C:\\claude\\production_mcp_shim\\generate_bundled_tools.py
+  ./.venv/Scripts/python.exe <shim repo>/generate_manifest_tools.py
 """
 from __future__ import annotations
 import json
@@ -17,7 +21,7 @@ sys.path.insert(0, r"C:\claude\punch-analytics")
 import server
 from server.dispatcher import list_tools_for_user
 
-OUT = Path(r"C:\claude\production_mcp_shim\tools.json")
+OUT = Path(__file__).resolve().parent / "manifest-tools.json"
 
 full = list_tools_for_user(full_access=True)
 non = list_tools_for_user(full_access=False)
@@ -42,7 +46,7 @@ snapshot = {
     "server_version": server.__version__,
     "generated_from": (
         "pa_v2 dispatcher.list_tools_for_user(full_access=False) — "
-        f"offline-fallback snapshot @ v{server.__version__}"
+        f"manifest.tools snapshot @ v{server.__version__}"
     ),
 }
 OUT.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

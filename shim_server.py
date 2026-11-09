@@ -202,7 +202,18 @@ from mcp.server.stdio import stdio_server
 # launch, so the env converges with no per-laptop action. Best-effort +
 # idempotent; never blocks startup. Logic change, but no behaviour change for
 # an already-fixed (v3.4.3+) manifest — it's a no-op there.
-_SHIM_VERSION = "3.6.6"
+_SHIM_VERSION = "3.6.7"
+# v3.6.7 — no bundled offline tool fallback. When the `sap` backend's /tools
+# failed on a cold start with no catalogue cache, the shim registered the names
+# in a tools.json beside this file. That file never tracks the live catalogue:
+# auto-update replaces only shim_server.py, so an old install still held 104 V1
+# get_*/jira_*/tempo_* names pa_v2 does not serve. _write_catalogue_cache then
+# persisted them, and Claude Desktop never re-pulls a tool list, so a user was
+# stuck with tools that fail with UnknownTool. Now an unreachable `sap`
+# registers 0 tools, like every other backend; the next tool call's
+# auto-refresh fills them from live and notifies. The X-Punch-Shim-Bundled-
+# Version header and shim_info's `bundled_server` (read from the same file; no
+# server reads them) are gone too. A tools.json left by an old .mcpb is inert.
 # v3.6.6 — one backend per URL. Discovery advertises pa_v2 as "sap"; a
 # backends.json listing the same :3000 URL as "pa_v2" kept both (merges keyed on
 # the name only), so the registry saw every pa_v2 tool twice and registered both
@@ -946,13 +957,11 @@ class Backend:
         rt = read_timeout if read_timeout is not None else PUNCH_SAP_TIMEOUT
         timeouts = httpx.Timeout(connect=5.0, read=rt, write=10.0, pool=5.0)
         limits = httpx.Limits(max_keepalive_connections=0, max_connections=10)
-        bundled_v = _bundled_server_version() or "unknown"
         headers: dict[str, str] = {
             "Content-Type": "application/json",
             "Connection": "close",
             "User-Agent": f"punch-shim/{_SHIM_VERSION}",
             "X-Punch-Shim-Backend": self.name,
-            "X-Punch-Shim-Bundled-Version": bundled_v,
             "X-Punch-Shim-Version": _SHIM_VERSION,
             "X-Punch-Shim-Pid": str(os.getpid()),
             "X-Punch-Shim-Auto-Update": "1" if _AUTO_UPDATE else "0",
@@ -1672,40 +1681,6 @@ def _maybe_reload_backends() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Bundled tools.json reader (kept from v2.2.2 — last-known-good fallback
-# for the SAP backend specifically when offline)
-# ---------------------------------------------------------------------------
-
-
-def _bundled_server_version() -> str | None:
-    """Read the highest 'Schema version: vX.Y.Z' stamp from the bundled
-    tools.json. Used by the User-Agent header so the server can spot
-    stale MCPB installs from telemetry."""
-    bundled_path = Path(__file__).parent / "tools.json"
-    if not bundled_path.exists():
-        return None
-    try:
-        data = json.loads(bundled_path.read_text())
-    except Exception:
-        return None
-    if not isinstance(data, dict):
-        return None
-    import re as _re
-    pat = _re.compile(r"Schema version: v(\d+\.\d+\.\d+)")
-    versions: list[tuple[int, ...]] = []
-    for tool in data.get("tools") or []:
-        desc = tool.get("description") or ""
-        for m in pat.finditer(desc):
-            try:
-                versions.append(tuple(int(p) for p in m.group(1).split(".")))
-            except Exception:
-                continue
-    if not versions:
-        return None
-    return ".".join(str(p) for p in max(versions))
-
-
-# ---------------------------------------------------------------------------
 # Resolve backends + primary at module load
 # ---------------------------------------------------------------------------
 
@@ -2362,10 +2337,7 @@ def _fetch_all_tools_parallel(backends: list[Backend]) -> None:
         return
 
     def _one(b: Backend) -> tuple[Backend, list[dict]]:
-        tools = _fetch_tools_for_backend(b) or []
-        if not tools and b.name == "sap":
-            tools = _load_bundled_sap_fallback()
-        return b, tools
+        return b, _fetch_tools_for_backend(b) or []
 
     try:
         with concurrent.futures.ThreadPoolExecutor(
@@ -2376,34 +2348,6 @@ def _fetch_all_tools_parallel(backends: list[Backend]) -> None:
     except Exception as e:
         _log_event("parallel_tools_fetch_error", level=logging.WARNING,
                    error=f"{type(e).__name__}: {e}")
-
-
-def _load_bundled_sap_fallback() -> list[dict]:
-    """If the SAP backend is unreachable AND a bundled tools.json
-    exists, register the bundled tool set under the SAP backend's name.
-    Pre-v2.2.4 single-backend behaviour."""
-    bundled_path = Path(__file__).parent / "tools.json"
-    if not bundled_path.exists():
-        return []
-    try:
-        data = json.loads(bundled_path.read_text())
-    except Exception as e:
-        _log_event("bundled_tools_parse_error", level=logging.WARNING,
-                   error=f"{type(e).__name__}: {e}")
-        return []
-    if not isinstance(data, dict):
-        return []
-    tools = data.get("tools") or []
-    if not isinstance(tools, list):
-        return []
-    bundled_sv = data.get("server_version") or _bundled_server_version() or "?"
-    _log_event("backend_tools_loaded",
-               backend="sap",
-               source="bundled",
-               tool_count=len(tools),
-               bundled_server_version=bundled_sv,
-               level=logging.WARNING)
-    return tools
 
 
 def _build_merged_registry(
@@ -2432,11 +2376,6 @@ def _build_merged_registry(
     for backend in backends:
         if not backend.tools and fetch_missing:
             backend.tools = _fetch_tools_for_backend(backend) or []
-            # SAP-specific bundled fallback for the offline case. Only
-            # applies to the backend named "sap" — other backends don't
-            # ship a bundled tools.json today.
-            if not backend.tools and backend.name == "sap":
-                backend.tools = _load_bundled_sap_fallback()
 
     # 2. Count occurrences of each bare tool name across backends.
     # v3.6.0 — skip any non-dict entry defensively. tools can come from a
@@ -3356,12 +3295,6 @@ async def shim_info(ctx: Context) -> str:
                 "registered_tool_count":  tool_count,
             })
 
-        # bundled_v: the version of pa_v2 the shim THINKS it's pinned to,
-        # via the bundled server-version file. Distinct from the live
-        # backend versions (which would require a /health probe and we
-        # deliberately don't do that here).
-        bundled_v = _bundled_server_version() or None
-
         # v3.0.3 — process-env diagnostics. Resolves the class of "shim
         # is reading config from somewhere I don't expect" mysteries in
         # one tool call instead of three PowerShell rounds. Sensitive
@@ -3380,7 +3313,6 @@ async def shim_info(ctx: Context) -> str:
         backends_file_path = _resolve_backends_path()
         return json.dumps({
             "shim_version":         _SHIM_VERSION,
-            "bundled_server":       bundled_v,
             "python":               f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
             "executable":           sys.executable,
             "platform":             sys.platform,

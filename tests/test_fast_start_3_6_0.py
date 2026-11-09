@@ -6,8 +6,8 @@ mcp.run()) moved off the critical path. These tests pin the new machinery:
 
   * a disk catalogue cache round-trips and is versioned;
   * cache load populates backend.tools (url-mismatch invalidates an entry);
-  * cold-start /tools fetch runs in parallel and honours the sap bundled
-    fallback;
+  * cold-start /tools fetch runs in parallel (v3.6.7: an unreachable sap gets
+    no bundled fallback, see test_no_bundled_fallback.py);
   * _build_merged_registry(fetch_missing=False) never touches the network;
   * _startup_warmup runs every step best-effort and never raises;
   * _start_background_warmup respects the PUNCH_SHIM_WARMUP kill-switch.
@@ -148,16 +148,6 @@ def test_fetch_all_tools_parallel_populates(monkeypatch):
     shim._fetch_all_tools_parallel([rd, zbx])
     assert rd.tools == [{"name": "rd_tool"}]
     assert zbx.tools == [{"name": "zabbix_tool"}]
-
-
-def test_fetch_all_tools_parallel_uses_sap_bundled_fallback(monkeypatch):
-    shim = _shim()
-    sap = _mk(shim, "sap")
-    monkeypatch.setattr(shim, "_fetch_tools_for_backend", lambda b: None)  # live fails
-    monkeypatch.setattr(shim, "_load_bundled_sap_fallback",
-                        lambda: [{"name": "bundled_sap_tool"}])
-    shim._fetch_all_tools_parallel([sap])
-    assert sap.tools == [{"name": "bundled_sap_tool"}]
 
 
 def test_fetch_all_tools_parallel_skips_configured_with_tools_and_unconfigured(monkeypatch):
