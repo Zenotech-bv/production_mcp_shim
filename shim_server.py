@@ -198,7 +198,11 @@ from mcp.server.stdio import stdio_server
 # launch, so the env converges with no per-laptop action. Best-effort +
 # idempotent; never blocks startup. Logic change, but no behaviour change for
 # an already-fixed (v3.4.3+) manifest — it's a no-op there.
-_SHIM_VERSION = "3.6.3"
+_SHIM_VERSION = "3.6.4"
+# v3.6.4 — a NEW CHAT sees a backend the OIDC flip healed. 3.6.2 re-fetched such
+# a backend only on a tool call, and a new chat lists tools before it calls one,
+# so an OIDC-only backend (hpc, 2026-11-09) stayed invisible until shim_reload.
+# tools/list now drains the same re-fetch queue first.
 # v3.6.3 — tool-list changes reach the client (backlog CAT-2). `initialize` now
 # advertises tools.listChanged=true (the SDK default said false: "this list
 # never changes"), and the auto-refresh sends notifications/tools/list_changed
@@ -2506,6 +2510,33 @@ def _apply_catalogue_reload(only: "set[str] | None" = None) -> dict:
     }
 
 
+def _drain_auth_flip_refetch(*, notify: bool) -> dict | None:
+    """v3.6.2 - a backend the OIDC directive flipped since the last drain got its
+    startup /tools on the old auth (a 401 for an OIDC-only backend). Re-fetch just
+    those, now, ignoring the /health throttle: /health did not change. Returns the
+    reload summary, or None when nothing was pending (no network at all).
+
+    Must run on the event-loop thread (it mutates the FastMCP registry). Callers:
+    the tool forwarders via _maybe_refresh_catalogue (notify=True), and, since
+    v3.6.4, tools/list (notify=False: the client is pulling the list right now)."""
+    with _AUTH_FLIP_LOCK:
+        flipped = set(_AUTH_FLIP_PENDING)
+        _AUTH_FLIP_PENDING.clear()
+    if not flipped:
+        return None
+    with _BACKENDS_RELOAD_LOCK:
+        result = _apply_catalogue_reload(only=flipped)
+    _log_event("catalogue_refetched_after_oidc_flip",
+               backends=sorted(flipped),
+               added=result["added"], removed=result["removed"],
+               changed=result["changed"], total=result["total"],
+               fetch_failures=result["fetch_failures"],
+               register_failures=result["register_failures"])
+    if notify and result["moved"]:
+        _notify_tools_list_changed("oidc_flip_refetch")
+    return result
+
+
 def _maybe_refresh_catalogue() -> dict | None:
     """Throttled tool-catalogue auto-refresh. Probes each backend's /health;
     on a (version, tool_count) delta — or an unknown baseline (startup probe
@@ -2515,23 +2546,8 @@ def _maybe_refresh_catalogue() -> dict | None:
     is never disturbed."""
     global _LAST_CATALOGUE_PROBE_MONO
 
-    # v3.6.2 - a backend the OIDC directive flipped since the last call got its
-    # startup /tools on the old auth (a 401 for an OIDC-only backend). Re-fetch
-    # just those, now, ignoring the /health throttle: /health did not change.
-    with _AUTH_FLIP_LOCK:
-        flipped = set(_AUTH_FLIP_PENDING)
-        _AUTH_FLIP_PENDING.clear()
-    if flipped:
-        with _BACKENDS_RELOAD_LOCK:
-            result = _apply_catalogue_reload(only=flipped)
-        _log_event("catalogue_refetched_after_oidc_flip",
-                   backends=sorted(flipped),
-                   added=result["added"], removed=result["removed"],
-                   changed=result["changed"], total=result["total"],
-                   fetch_failures=result["fetch_failures"],
-                   register_failures=result["register_failures"])
-        if result["moved"]:
-            _notify_tools_list_changed("oidc_flip_refetch")
+    result = _drain_auth_flip_refetch(notify=True)
+    if result is not None:
         return result
 
     now = time.monotonic()
@@ -2865,7 +2881,19 @@ def _client_name() -> str | None:
 class _ShimFastMCP(FastMCP):
     async def list_tools(self):
         """v3.6.3 — log every tools/list answered, so the shim log shows whether
-        a client re-pulled the list after a list_changed (backlog CAT-2)."""
+        a client re-pulled the list after a list_changed (backlog CAT-2).
+
+        v3.6.4 — first drain the OIDC-flip re-fetch queue. A new chat lists tools
+        before it calls any, and 3.6.2 drained the queue only on a tool call, so an
+        OIDC-only backend whose startup /tools 401'd stayed invisible in every new
+        chat until a manual shim_reload (hpc, 2026-11-09). This runs on the loop
+        thread, as the registry contract requires, and costs nothing when no flip
+        is pending. Never lets a failure here break tools/list."""
+        try:
+            _drain_auth_flip_refetch(notify=False)
+        except Exception as e:
+            _log_event("tools_list_flip_refetch_failed", level=logging.WARNING,
+                       error=f"{type(e).__name__}: {e}")
         tools = await super().list_tools()
         _log_event("tools_list_served", tool_count=len(tools),
                    client=_client_name(), pid=os.getpid())
