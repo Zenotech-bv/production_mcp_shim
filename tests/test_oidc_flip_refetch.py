@@ -102,6 +102,49 @@ def test_oidc_flip_refetches_backend_that_401d_at_startup(monkeypatch):
     assert shim._maybe_refresh_catalogue() is None
 
 
+def test_new_chat_tools_list_refetches_a_flipped_backend_without_a_tool_call(monkeypatch):
+    """Seen 2026-11-09 with hpc (:3004, OIDC only): the shim started, /tools 401'd
+    on negotiate, the directive flipped hpc to oidc, and a NEW CHAT then asked
+    tools/list and got no hpc tools. 3.6.2 drains the flip queue only on a tool
+    CALL, and a fresh chat lists tools before it calls any, so nothing re-fetched
+    until the user ran shim_reload by hand. tools/list must drain the queue too."""
+    import asyncio
+    shim = _shim()
+    b = shim.Backend(name="hpc", url="http://hpc.invalid:3004",
+                     header="X-Punch-Auth", key="", auth="negotiate")
+    tools = [{"name": "hpc_cluster_status", "description": "d",
+              "inputSchema": {"type": "object", "properties": {}}}]
+    monkeypatch.setattr(b, "http_client", _routing_client(b, tools))
+    registered = _isolate(shim, monkeypatch, b)
+
+    assert shim._fetch_tools_for_backend(b) is None   # startup fetch on negotiate: 401
+    shim._apply_auth_directives([b])                   # background flip to oidc
+    assert b.effective_auth == "oidc"
+
+    asyncio.run(shim.mcp.list_tools())                 # a new chat, no tool call
+
+    assert [t["name"] for t in b.tools] == ["hpc_cluster_status"]
+    assert registered, "a new chat's tools/list did not pick up the flipped backend"
+    assert shim._AUTH_FLIP_PENDING == set()
+
+
+def test_tools_list_without_a_pending_flip_fetches_nothing(monkeypatch):
+    """tools/list is answered for every chat. With nothing flipped it must not touch
+    the network, or every new chat would pay a /tools round trip per backend."""
+    import asyncio
+    shim = _shim()
+    b = shim.Backend(name="hpc", url="http://hpc.invalid:3004",
+                     header="X-Punch-Auth", key="", auth="negotiate")
+    _isolate(shim, monkeypatch, b)
+    fetched = []
+    monkeypatch.setattr(shim, "_fetch_tools_for_backend",
+                        lambda backend: fetched.append(backend.name) or [])
+
+    asyncio.run(shim.mcp.list_tools())
+
+    assert fetched == []
+
+
 def test_reprobe_that_keeps_oidc_does_not_queue_a_refetch(monkeypatch):
     """shim_reload re-runs the directive over the same Backend objects. A backend
     that was already on OIDC must not be queued again, or every shim_reload would

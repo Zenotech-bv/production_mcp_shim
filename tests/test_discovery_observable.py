@@ -151,3 +151,42 @@ def test_reload_resolves_auth_for_a_backend_that_has_just_appeared(monkeypatch):
     # directives after the catalogue reload, and that is unchanged. What matters is that a backend which
     # has just appeared gets its directive BEFORE its /tools call, not that nothing else happens.
     assert order[:2] == ["auth", "catalogue"], f"auth must be resolved before /tools is called, got {order}"
+
+
+def test_reload_waits_for_the_auth_directive_to_finish_before_the_catalogue(monkeypatch):
+    """The test above only proves the directive was STARTED first. It runs on a thread, and the reload did
+    not wait for it, so the /tools call still went out on negotiate and an OIDC-only backend (hpc, :3004,
+    2026-11-09) answered 401. The reload must wait for the directive to finish, within a bound."""
+    import threading
+    import time
+    shim = _shim(monkeypatch, discovery_url="")
+    monkeypatch.setattr(shim, "_BACKENDS", [])
+    monkeypatch.setattr(shim, "_fetch_discovery",
+                        lambda: {"backends": [{"name": "hpc", "url": "http://ai:3004", "auth": "negotiate"}]})
+    order = []
+
+    def _slow_directive(*a, **k):
+        def _run():
+            time.sleep(0.3)
+            order.append("auth-done")
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        return t
+
+    monkeypatch.setattr(shim, "_apply_auth_directives_async", _slow_directive)
+    monkeypatch.setattr(shim, "_apply_catalogue_reload",
+                        lambda: (order.append("catalogue"),
+                                 {"added": [], "removed": [], "changed": [], "moved": False,
+                                  "total_registered": 0, "fetch_failures": [],
+                                  "register_failures": []})[1])
+
+    import asyncio
+
+    class _Ctx:
+        class session:
+            @staticmethod
+            async def send_tool_list_changed():
+                pass
+
+    asyncio.run(shim.shim_reload(_Ctx()))
+    assert order[:2] == ["auth-done", "catalogue"], f"the reload fetched /tools before auth finished: {order}"

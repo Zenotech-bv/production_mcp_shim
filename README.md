@@ -89,7 +89,7 @@ Claude Desktop ignores that notification (proven with 3.6.3): it reads
 the tool list once, and only a full tray Quit makes it read it again.
 So the list the shim serves at start is the list the session keeps.
 
-## Backend discovery (SHIM-1, v3.6.4)
+## Backend discovery (SHIM-1, v3.6.5)
 
 A laptop's `backends.json` holds only `sap` and `zabbix`. At import the
 shim asks the supervisor
@@ -97,7 +97,7 @@ shim asks the supervisor
 timeout) for the rest: `rd`, `tutorials`, `soc`. Discovery only adds;
 a name in `backends.json` always wins.
 
-Since v3.6.4 each good answer is saved to
+Since v3.6.5 each good answer is saved to
 `%LOCALAPPDATA%\PunchAnalytics\discovered_backends.json`. When the GET
 fails (timeout, refused, bad answer, empty list), the shim uses the
 saved set (`discovery_used_saved_set` in `shim.log`), and the catalogue
@@ -109,7 +109,7 @@ short list until a tray Quit.
 - An empty or unusable answer is not saved.
 - The saved set is used only for the same discovery URL, and never
   when `PUNCH_SHIM_DISCOVERY_URL=""` (discovery off).
-- With no saved set yet (first start on v3.6.4), a failed GET still
+- With no saved set yet (first start on v3.6.5), a failed GET still
   starts on `backends.json` alone (`discovery_unavailable`).
 - `shim_reload` re-runs discovery and adds a missing backend to the
   running shim. Claude Desktop still shows its tools only after a tray
