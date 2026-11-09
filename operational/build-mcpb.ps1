@@ -75,7 +75,7 @@ Step "Replace shim_server.py"
 Copy-Item -LiteralPath $canonical -Destination (Join-Path $staging 'server\shim_server.py') -Force
 Ok "shim_server.py updated"
 
-Step "Drop server\tools.json (v3.6.5 - no bundled offline tool fallback)"
+Step "Drop server\tools.json (v3.6.7 - no bundled offline tool fallback)"
 # Up to v3.6.4 the shim registered the names in server\tools.json when the sap
 # backend was unreachable on a cold start. That snapshot never tracked the live
 # catalogue (auto-update replaces only shim_server.py), so laptops got stuck
@@ -233,7 +233,7 @@ if ($LongDescription) {
 # v3.4.2 - sync the declared `tools` array from the repo's catalogue snapshot so
 # the connector directory shows the CURRENT catalogue, not the baseline's frozen
 # V1 set (the 2.4.1 baseline declared 92 get_* V1 tools the v2 backend never
-# serves). v3.6.5 - the snapshot is manifest-tools.json (was tools.json). It is
+# serves). v3.6.7 - the snapshot is manifest-tools.json (was tools.json). It is
 # directory text only: it is not packaged, and the shim never reads it; the
 # shim registers what each backend's /tools returns. Regenerate before a
 # release with generate_manifest_tools.py (see its docstring).

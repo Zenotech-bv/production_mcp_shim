@@ -1,4 +1,4 @@
-"""v3.6.5 — no bundled offline tool fallback.
+"""v3.6.7 — no bundled offline tool fallback.
 
 Up to v3.6.4, when the `sap` backend's /tools failed and there was no
 catalogue cache, the shim registered the tool names from a `tools.json`

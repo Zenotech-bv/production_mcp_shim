@@ -43,6 +43,10 @@ For every tool ``T`` from backend ``B``:
 The collision-only-strips-bare rule means single-backend deployments
 behave exactly as before — every tool keeps its original name.
 
+Two backends on the same URL are one server, not a collision: since
+v3.6.4 the second one (from backends.json or discovery) is skipped, so
+its catalogue is not registered twice under two prefixes.
+
 ## Soft-fail on backend unreachable
 
 A backend that's unreachable at startup (DNS failure, connection
@@ -198,8 +202,8 @@ from mcp.server.stdio import stdio_server
 # launch, so the env converges with no per-laptop action. Best-effort +
 # idempotent; never blocks startup. Logic change, but no behaviour change for
 # an already-fixed (v3.4.3+) manifest — it's a no-op there.
-_SHIM_VERSION = "3.6.5"
-# v3.6.5 — no bundled offline tool fallback. When the `sap` backend's /tools
+_SHIM_VERSION = "3.6.7"
+# v3.6.7 — no bundled offline tool fallback. When the `sap` backend's /tools
 # failed on a cold start with no catalogue cache, the shim registered the names
 # in a tools.json beside this file. That file never tracks the live catalogue:
 # auto-update replaces only shim_server.py, so an old install still held 104 V1
@@ -210,6 +214,22 @@ _SHIM_VERSION = "3.6.5"
 # auto-refresh fills them from live and notifies. The X-Punch-Shim-Bundled-
 # Version header and shim_info's `bundled_server` (read from the same file; no
 # server reads them) are gone too. A tools.json left by an old .mcpb is inert.
+# v3.6.6 — one backend per URL. Discovery advertises pa_v2 as "sap"; a
+# backends.json listing the same :3000 URL as "pa_v2" kept both (merges keyed on
+# the name only), so the registry saw every pa_v2 tool twice and registered both
+# prefixed forms: registered_count 485, collision_count 239. A backend whose
+# normalised URL (_normalise_backend_url) is already loaded — from backends.json
+# or from discovery — is now skipped with one backend_duplicate_url_skipped line.
+# Same-name tools on DIFFERENT URLs still collide and get prefixed as before.
+# v3.6.5 — a failed supervisor discovery no longer shrinks the backend set. Each
+# good answer is saved (discovered_backends.json, beside the catalogue cache) and
+# a failed one falls back to it, so a timeout at start no longer leaves the
+# session on sap + zabbix (312 of 405 tools) until a tray Quit. Also carries
+# 268eac1: every discovery outcome is logged, and shim_reload re-runs discovery.
+# v3.6.4 — a NEW CHAT sees a backend the OIDC flip healed. 3.6.2 re-fetched such
+# a backend only on a tool call, and a new chat lists tools before it calls one,
+# so an OIDC-only backend (hpc, 2026-11-09) stayed invisible until shim_reload.
+# tools/list now drains the same re-fetch queue first.
 # v3.6.3 — tool-list changes reach the client (backlog CAT-2). `initialize` now
 # advertises tools.listChanged=true (the SDK default said false: "this list
 # never changes"), and the auto-refresh sends notifications/tools/list_changed
@@ -1107,6 +1127,21 @@ def _resolve_backends_path() -> Path:
     return Path.home() / ".config" / "punch" / "backends.json"
 
 
+def _normalise_backend_url(url: str) -> str:
+    """Comparison key for "is this the same backend?" — scheme, host, port and
+    path; scheme + host case-insensitive; no trailing slash. Used to skip a
+    second backend on a URL already loaded (v3.6.4). Never raises: an
+    unparseable URL compares as its stripped, case-folded text."""
+    try:
+        p = urlparse(url.strip())
+        host = (p.hostname or "").lower()
+        port = p.port
+    except ValueError:
+        return url.strip().rstrip("/").lower()
+    netloc = f"{host}:{port}" if port is not None else host
+    return f"{p.scheme.lower()}://{netloc}{p.path.rstrip('/')}"
+
+
 def _load_backends_from_file(path: Path) -> tuple[list[Backend], str | None]:
     """Parse backends.json. Returns (list_of_backends, primary_name).
     Logs+raises on malformed files (caller should soft-fail to env-var
@@ -1125,6 +1160,7 @@ def _load_backends_from_file(path: Path) -> tuple[list[Backend], str | None]:
 
     backends: list[Backend] = []
     seen_names: set[str] = set()
+    seen_urls: dict[str, str] = {}   # normalised url -> name of the entry that owns it
     for i, entry in enumerate(raw_backends):
         if not isinstance(entry, dict):
             _log_event("backends_entry_skipped", level=logging.WARNING,
@@ -1165,6 +1201,13 @@ def _load_backends_from_file(path: Path) -> tuple[list[Backend], str | None]:
             _log_event("backends_entry_skipped", level=logging.WARNING,
                        index=i, name=name, reason="duplicate_name")
             continue
+        norm_url = _normalise_backend_url(url)
+        if norm_url in seen_urls:
+            _log_event("backend_duplicate_url_skipped", level=logging.WARNING,
+                       backend=name, duplicate_of=seen_urls[norm_url], url=url,
+                       source="config_file")
+            continue
+        seen_urls[norm_url] = name
         seen_names.add(name)
         backends.append(Backend(name=name, url=url, header=header, key=key, auth=auth))
 
@@ -1653,6 +1696,83 @@ _DISCOVERY_URL = os.environ.get(
     "http://ai.punchpowertrain.com:3030/api/discover/backends",
 )
 _DISCOVERY_TIMEOUT_S = 3.0
+# v3.6.4 — the last good discovery answer is saved to disk, and a failed discovery
+# falls back to it. A failed GET used to start the shim on backends.json alone
+# (sap + zabbix: 312 tools of 405), and Claude Desktop ignores
+# notifications/tools/list_changed (proven with 3.6.3), so rd, soc and tutorials
+# stayed missing for the whole Desktop session. No retry and no longer timeout:
+# with the saved set a failure costs nothing, while every extra second here
+# delays `initialize` on each failed start (the v3.6.0 fast-start rule).
+_DISCOVERED_BACKENDS_VERSION = 1
+
+
+def _discovered_backends_path() -> Path:
+    """Where the last good discovery answer is saved — beside the catalogue cache
+    under %LOCALAPPDATA%\\PunchAnalytics (test-isolated via _resolve_log_dir)."""
+    return _resolve_log_dir() / "discovered_backends.json"
+
+
+def _valid_discovery_entries(raw: Any) -> list[dict]:
+    """The usable {name, url, auth} entries of a discovery `backends` array,
+    normalised. Entries without a name or url are skipped and logged. A
+    non-string value counts as missing: this also reads the saved file at
+    import, where a raise would stop the shim from starting."""
+    def _s(v: Any) -> str:
+        return v.strip() if isinstance(v, str) else ""
+
+    entries: list[dict] = []
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        name = _s(entry.get("name"))
+        url = _s(entry.get("url"))
+        auth = (_s(entry.get("auth")) or "x-punch-auth").lower()
+        if not name or not url:
+            _log_event("discovery_entry_skipped", level=logging.WARNING,
+                       reason="missing_name_or_url")
+            continue
+        entries.append({"name": name, "url": url, "auth": auth})
+    return entries
+
+
+def _save_discovered_backends(entries: list[dict]) -> None:
+    """Save a good discovery answer. It REPLACES the saved set, so a backend the
+    supervisor retires (render, 2026-11-02) does not come back from disk. Written
+    to a temp file and renamed, so a shim starting at the same moment never reads
+    half a file. Best-effort; never raises."""
+    payload = {
+        "cache_version": _DISCOVERED_BACKENDS_VERSION,
+        "discovery_url": _DISCOVERY_URL,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "backends": entries,
+    }
+    path = _discovered_backends_path()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as e:
+        _log_event("discovered_backends_save_failed", level=logging.WARNING,
+                   error=f"{type(e).__name__}: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _load_discovered_backends() -> tuple[list[dict], str] | None:
+    """The saved set as (entries, saved_at), or None if absent / unreadable / a
+    different version / saved from a different discovery URL. Never raises."""
+    try:
+        data = json.loads(_discovered_backends_path().read_text(encoding="utf-8"))
+    except Exception:   # absent, locked, not JSON, too deep: all mean "no saved set"
+        return None
+    if (not isinstance(data, dict)
+            or data.get("cache_version") != _DISCOVERED_BACKENDS_VERSION
+            or data.get("discovery_url") != _DISCOVERY_URL):
+        return None
+    entries = _valid_discovery_entries(data.get("backends"))
+    return (entries, str(data.get("saved_at") or "")) if entries else None
 
 
 def _fetch_discovery() -> dict | None:
@@ -1660,6 +1780,13 @@ def _fetch_discovery() -> dict | None:
     object, or None on any failure -- disabled (empty URL), unreachable,
     timeout, non-200, or a non-JSON / non-object body. Never raises."""
     if not _DISCOVERY_URL:
+        # WAS THE ONE SILENT EXIT IN THIS FUNCTION, and on 2026-09-29 it cost three restarts: the shim
+        # came up with 2 backends of 5, every other exit here logs, and the log said nothing at all --
+        # so the cause could not be established from it. An unexplained failure is a bug even when the
+        # behaviour is intended.
+        _log_event("discovery_disabled", level=logging.WARNING,
+                   reason="PUNCH_SHIM_DISCOVERY_URL is empty, so the supervisor is never asked",
+                   note="backends come only from backends.json, which on a laptop is sap + zabbix")
         return None
     try:
         with httpx.Client(timeout=_DISCOVERY_TIMEOUT_S) as c:
@@ -1680,40 +1807,74 @@ def _discover_backends(backends: list[Backend]) -> list[Backend]:
     """Merge supervisor-discovered backends into `backends`, additive-only.
 
     Appends any discovered backend whose name is not already present; a
-    name already loaded locally is never overridden. Best-effort: when
+    name already loaded locally is never overridden. v3.6.4: a discovered
+    backend whose normalised URL is already loaded is skipped too — the
+    supervisor advertises pa_v2 as "sap" while a laptop's backends.json may
+    list the same :3000 URL as "pa_v2", and keeping both registered the whole
+    pa_v2 catalogue twice (485 tools, 239 collisions). Best-effort: when
     discovery is unavailable (`_fetch_discovery` -> None) or the payload
-    is malformed, `backends` is returned unchanged. Discovery never blocks
-    startup and never shrinks the backend set."""
+    is malformed, the last good answer saved on disk is merged instead
+    (v3.6.4); with no saved answer `backends` is returned unchanged. Discovery
+    never blocks startup and never shrinks the backend set."""
     payload = _fetch_discovery()
-    if payload is None:
-        return backends
-    discovered = payload.get("backends")
-    if not isinstance(discovered, list):
-        _log_event("discovery_skipped", level=logging.WARNING,
-                   reason="no_backends_array", url=_DISCOVERY_URL)
-        return backends
+    entries: list[dict] = []
+    if payload is not None:
+        discovered = payload.get("backends")
+        if not isinstance(discovered, list):
+            _log_event("discovery_skipped", level=logging.WARNING,
+                       reason="no_backends_array", url=_DISCOVERY_URL)
+        else:
+            entries = _valid_discovery_entries(discovered)
+            if not entries:
+                # An empty list is a supervisor fault, not "no backends exist":
+                # saving it would wipe the good set.
+                _log_event("discovery_skipped", level=logging.WARNING,
+                           reason="no_usable_backend", url=_DISCOVERY_URL)
+    source = "live"
+    if entries:
+        _save_discovered_backends(entries)
+    else:
+        # Disabled discovery means "backends.json only" (tests, ops escape hatch),
+        # so the saved set is used only when discovery is on and failed.
+        saved = _load_discovered_backends() if _DISCOVERY_URL else None
+        if saved is None:
+            if payload is None:
+                _log_event("discovery_unavailable", level=logging.WARNING,
+                           backends=[b.name for b in backends],
+                           note="running on the local backend list only; a discovered backend registers no tools")
+            return backends
+        entries, saved_at = saved
+        source = "saved"
+        _log_event("discovery_used_saved_set", level=logging.WARNING,
+                   backends=[e["name"] for e in entries], saved_at=saved_at,
+                   note="the supervisor did not answer; using the last backend set it gave")
 
     known = {b.name for b in backends}
+    known_urls = {_normalise_backend_url(b.url): b.name for b in backends}
     result = list(backends)
     added: list[str] = []
-    for entry in discovered:
-        if not isinstance(entry, dict):
-            continue
-        name = (entry.get("name") or "").strip()
-        url = (entry.get("url") or "").strip()
-        auth = (entry.get("auth") or "x-punch-auth").strip().lower()
-        if not name or not url:
-            _log_event("discovery_entry_skipped", level=logging.WARNING,
-                       reason="missing_name_or_url")
-            continue
-        if name in known:
+    for e in entries:
+        if e["name"] in known:
             continue                       # additive-only: local always wins
-        known.add(name)
-        result.append(Backend(name=name, url=url, header="X-Punch-Auth",
-                              key="", auth=auth))
-        added.append(name)
+        norm_url = _normalise_backend_url(e["url"])
+        if norm_url in known_urls:
+            _log_event("backend_duplicate_url_skipped", level=logging.WARNING,
+                       backend=e["name"], duplicate_of=known_urls[norm_url], url=e["url"],
+                       source="discovery")
+            continue
+        known.add(e["name"])
+        known_urls[norm_url] = e["name"]
+        result.append(Backend(name=e["name"], url=e["url"], header="X-Punch-Auth",
+                              key="", auth=e["auth"]))
+        added.append(e["name"])
     if added:
-        _log_event("discovery_merged", added=added, total_backends=len(result))
+        _log_event("discovery_merged", added=added, total_backends=len(result), source=source)
+    else:
+        # ALSO LOGGED. "Discovery ran and added nothing" and "discovery never ran" produced the same
+        # silence, and they need entirely different fixes.
+        _log_event("discovery_added_nothing", level=logging.INFO,
+                   discovered=[e["name"] for e in entries], source=source,
+                   already_known=sorted(known), total_backends=len(result))
     return result
 
 
@@ -2445,6 +2606,33 @@ def _apply_catalogue_reload(only: "set[str] | None" = None) -> dict:
     }
 
 
+def _drain_auth_flip_refetch(*, notify: bool) -> dict | None:
+    """v3.6.2 - a backend the OIDC directive flipped since the last drain got its
+    startup /tools on the old auth (a 401 for an OIDC-only backend). Re-fetch just
+    those, now, ignoring the /health throttle: /health did not change. Returns the
+    reload summary, or None when nothing was pending (no network at all).
+
+    Must run on the event-loop thread (it mutates the FastMCP registry). Callers:
+    the tool forwarders via _maybe_refresh_catalogue (notify=True), and, since
+    v3.6.4, tools/list (notify=False: the client is pulling the list right now)."""
+    with _AUTH_FLIP_LOCK:
+        flipped = set(_AUTH_FLIP_PENDING)
+        _AUTH_FLIP_PENDING.clear()
+    if not flipped:
+        return None
+    with _BACKENDS_RELOAD_LOCK:
+        result = _apply_catalogue_reload(only=flipped)
+    _log_event("catalogue_refetched_after_oidc_flip",
+               backends=sorted(flipped),
+               added=result["added"], removed=result["removed"],
+               changed=result["changed"], total=result["total"],
+               fetch_failures=result["fetch_failures"],
+               register_failures=result["register_failures"])
+    if notify and result["moved"]:
+        _notify_tools_list_changed("oidc_flip_refetch")
+    return result
+
+
 def _maybe_refresh_catalogue() -> dict | None:
     """Throttled tool-catalogue auto-refresh. Probes each backend's /health;
     on a (version, tool_count) delta — or an unknown baseline (startup probe
@@ -2454,23 +2642,8 @@ def _maybe_refresh_catalogue() -> dict | None:
     is never disturbed."""
     global _LAST_CATALOGUE_PROBE_MONO
 
-    # v3.6.2 - a backend the OIDC directive flipped since the last call got its
-    # startup /tools on the old auth (a 401 for an OIDC-only backend). Re-fetch
-    # just those, now, ignoring the /health throttle: /health did not change.
-    with _AUTH_FLIP_LOCK:
-        flipped = set(_AUTH_FLIP_PENDING)
-        _AUTH_FLIP_PENDING.clear()
-    if flipped:
-        with _BACKENDS_RELOAD_LOCK:
-            result = _apply_catalogue_reload(only=flipped)
-        _log_event("catalogue_refetched_after_oidc_flip",
-                   backends=sorted(flipped),
-                   added=result["added"], removed=result["removed"],
-                   changed=result["changed"], total=result["total"],
-                   fetch_failures=result["fetch_failures"],
-                   register_failures=result["register_failures"])
-        if result["moved"]:
-            _notify_tools_list_changed("oidc_flip_refetch")
+    result = _drain_auth_flip_refetch(notify=True)
+    if result is not None:
         return result
 
     now = time.monotonic()
@@ -2804,7 +2977,19 @@ def _client_name() -> str | None:
 class _ShimFastMCP(FastMCP):
     async def list_tools(self):
         """v3.6.3 — log every tools/list answered, so the shim log shows whether
-        a client re-pulled the list after a list_changed (backlog CAT-2)."""
+        a client re-pulled the list after a list_changed (backlog CAT-2).
+
+        v3.6.4 — first drain the OIDC-flip re-fetch queue. A new chat lists tools
+        before it calls any, and 3.6.2 drained the queue only on a tool call, so an
+        OIDC-only backend whose startup /tools 401'd stayed invisible in every new
+        chat until a manual shim_reload (hpc, 2026-11-09). This runs on the loop
+        thread, as the registry contract requires, and costs nothing when no flip
+        is pending. Never lets a failure here break tools/list."""
+        try:
+            _drain_auth_flip_refetch(notify=False)
+        except Exception as e:
+            _log_event("tools_list_flip_refetch_failed", level=logging.WARNING,
+                       error=f"{type(e).__name__}: {e}")
         tools = await super().list_tools()
         _log_event("tools_list_served", tool_count=len(tools),
                    client=_client_name(), pid=os.getpid())
@@ -2957,15 +3142,47 @@ if _REGISTRATION_FAILURES:
 # client re-pulls the catalogue mid-conversation.
 # ---------------------------------------------------------------------------
 
+# Longest a shim_reload waits for a just-discovered backend's auth directive: one /auth/mode probe
+# (5 s timeout) plus a silent token refresh, with room to spare. Interactive sign-in is never allowed here.
+_APPEARED_AUTH_WAIT_S = 20.0
+
+
 async def shim_reload(ctx: Context) -> str:
-    """Re-fetch the tool catalogue from every Punch backend and update this
-    shim's registered tools in place — no Claude Desktop restart needed. Call
-    this after a backend gains, drops, or changes a tool."""
+    """Re-ask the supervisor which backends exist, re-fetch every backend's tool
+    catalogue, and update this shim's registered tools in place — no Claude
+    Desktop restart needed. Call this after a backend gains, drops, or changes a
+    tool, or when a backend is missing entirely."""
     try:
         # v3.6.0 - hold the reload lock (consistent with _maybe_refresh_catalogue)
         # so a reconcile is never interleaved with the auto-refresh path.
         with _BACKENDS_RELOAD_LOCK:
+            # DISCOVERY FIRST, so a reload can repair a SHORT BACKEND LIST and not only a stale
+            # catalogue. On 2026-09-29 the shim came up with 2 backends of 5 and this tool answered
+            # "No changes - every backend's catalogue is already current" while three backends were
+            # missing and every soc_*, windchill_*, polarion_* and svn_* tool was absent. The only
+            # remedy left was a Claude Desktop restart, which is the thing this tool exists to avoid --
+            # and which did not fix it either.
+            #
+            # Safe here: discovery is additive only, so it can never remove a working backend, and it
+            # never raises. The worst case is that it adds nothing, which is today's behaviour anyway.
+            global _BACKENDS
+            before = {b.name for b in _BACKENDS}
+            _BACKENDS = _discover_backends(_BACKENDS)
+            appeared = sorted({b.name for b in _BACKENDS} - before)
+            if appeared:
+                # A backend that has just appeared has no auth directive yet, so resolve one before its
+                # catalogue is fetched -- otherwise its /tools call goes out on the wrong scheme and the
+                # reload reports it as a failure rather than adding its tools.
+                # The directive runs on a thread, so WAIT for it (bounded): starting it was not enough,
+                # and hpc's /tools still went out on negotiate and 401'd (2026-11-09). On a timeout the
+                # flip still lands later, and tools/list or the next tool call re-fetches (v3.6.4).
+                t = _apply_auth_directives_async(_BACKENDS, block=True, allow_interactive=False)
+                if t is not None:
+                    t.join(timeout=_APPEARED_AUTH_WAIT_S)
+                _log_event("discovery_recovered_backends", appeared=appeared,
+                           total_backends=len(_BACKENDS))
             r = _apply_catalogue_reload()
+            r["backends_appeared"] = appeared
 
         # v3.5.2 - reprobe OIDC directives OFF the event loop (background daemon)
         # and NON-interactively: a shim_reload must never block the conversation

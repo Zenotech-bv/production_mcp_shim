@@ -6,7 +6,7 @@ mcp.run()) moved off the critical path. These tests pin the new machinery:
 
   * a disk catalogue cache round-trips and is versioned;
   * cache load populates backend.tools (url-mismatch invalidates an entry);
-  * cold-start /tools fetch runs in parallel (v3.6.5: an unreachable sap gets
+  * cold-start /tools fetch runs in parallel (v3.6.7: an unreachable sap gets
     no bundled fallback, see test_no_bundled_fallback.py);
   * _build_merged_registry(fetch_missing=False) never touches the network;
   * _startup_warmup runs every step best-effort and never raises;
