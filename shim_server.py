@@ -198,7 +198,11 @@ from mcp.server.stdio import stdio_server
 # launch, so the env converges with no per-laptop action. Best-effort +
 # idempotent; never blocks startup. Logic change, but no behaviour change for
 # an already-fixed (v3.4.3+) manifest — it's a no-op there.
-_SHIM_VERSION = "3.6.3"
+_SHIM_VERSION = "3.6.4"
+# v3.6.4 — a NEW CHAT sees a backend the OIDC flip healed. 3.6.2 re-fetched such
+# a backend only on a tool call, and a new chat lists tools before it calls one,
+# so an OIDC-only backend (hpc, 2026-11-09) stayed invisible until shim_reload.
+# tools/list now drains the same re-fetch queue first.
 # v3.6.3 — tool-list changes reach the client (backlog CAT-2). `initialize` now
 # advertises tools.listChanged=true (the SDK default said false: "this list
 # never changes"), and the auto-refresh sends notifications/tools/list_changed
